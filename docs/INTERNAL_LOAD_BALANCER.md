@@ -1,32 +1,288 @@
 # Internal Load Balancer & Partition Leader Resolver
 
+> **Related:** [WRITE_PATH.md](WRITE_PATH.md), [READ_PATH.md](READ_PATH.md),
+> [CLUSTERING.md](CLUSTERING.md), [SECURITY.md](SECURITY.md), [MULTI_TENANT.md](MULTI_TENANT.md),
+> [STORAGE.md](STORAGE.md), [CERT_MANAGEMENT.md](CERT_MANAGEMENT.md)
+
 ## Overview
 
-The internal load balancer has two separate concerns:
-
-1. **Client-side partition selection** — which partition within a topic receives a message
-   (key-based, explicit, or round-robin — runs in protocol handlers)
-
-2. **Broker-side ownership routing** — which broker owns a partition
-   (HRW deterministic hash — runs in `DefaultBrokerEngine` before write/read)
-
-These are independent: the client picks the partition; the broker picks the owner.
+The internal load balancer handles the complete request lifecycle from TCP connection to
+write/read completion across **five phases**, executed in strict order:
 
 ```
-Protocol Handler
-  │  parse address → ParsedDestination
-  │  RouteTable.resolve(tenant, protocol, address, key, explicitPartition)
-  │    ├─ DestinationParser  → baseName + optionalPartition (per protocol)
-  │    ├─ DestinationResolver → DestinationId + partitionCount
-  │    └─ PartitionRouter    → RoutedPartition(PartitionId, partitionNum)
+TCP Connection
   ↓
-DefaultBrokerEngine.write(tenantId, pendingWrites, secCtx)
-  │
-  HRWRouter.ownerOf(partitionId)   ← uses MetadataImage (local, no network)
-  │
-  ├─ [OWNER == self]  → WriteAccumulator → WriteWorker → PG COMMIT → ACK
-  └─ [OWNER != self]  → ForwardWriteManager → InterBrokerRpcClient → owner
+Phase A — Netty Pipeline Assembly (TLS, SNI tenant resolution, protocol detection)
+  ↓
+Phase B — Security Pipeline (8-layer: auth, identity mapping, ACL, quota)
+  ↓
+Phase C — Transformation Pipeline (masking, schema, encryption, JSONata — may change key)
+  ↓
+Phase 1 — Partition Selection (DestinationParser → DestinationResolver → PartitionRouter)
+  ↓
+Phase 2 — Ownership Routing (HRW → Local/Forward/NoLeader)
+  ↓
+Phase 3 — Write Forwarding or Local Write (WriteAccumulator → PG COMMIT → ACK)
 ```
+
+**Critical ordering invariant: Transform (Phase C) BEFORE Resolve (Phase 1).** Transforms can
+change the message key, and the key determines partition assignment. Resolving first then
+transforming routes messages to the wrong partition.
+
+```
+TCP Connection Established
+  ↓
+[proxy-protocol] → [tls + SNI] → [tenant-resolver] → [tenant-context] → [auth]
+  → [protocol-detector] → [negotiation] → [flow-controller] → [exception-handler]
+  ↓
+Protocol Handler (decode wire → RawMessage)
+  ↓
+TransformationPipeline.execute(ctx, List<RawMessage>)
+  │  schema validation, masking, encryption, JSONata, header injection
+  │  RawMessage → TransformedMessage (key may change!)
+  ↓
+RouteTable.resolve(tenant, protocol, transformedMessage)
+  │  DestinationParser → DestinationResolver → PartitionRouter
+  │  TransformedMessage → PartitionId (Murmur2 / round-robin / explicit)
+  ↓
+HRWRouter.ownerOf(partitionId)
+  ├─ [OWNER == self]  → WriteAccumulator → WriteWorker → PG COMMIT → ACK
+  └─ [OWNER != self]  → Forwarder → InterBrokerRpcClient → owner → ACK
+```
+
+---
+
+## Phase A: Netty Pipeline Assembly
+
+### Handler Chain (8 Layers)
+
+Every new TCP connection gets the following Netty pipeline, assembled by `ChannelPipelineFactory`:
+
+```
+Layer 0: [proxy-protocol]     (optional)  HAProxy PROXY v1/v2 — must come before TLS
+Layer 1: [tls]                (conditional) SSL/TLS termination — AtomicReference<SslContext> for hot-reload
+Layer 2: [tenant-resolver]    (conditional) SNI hostname → TenantId — fires on SslHandshakeCompletionEvent
+Layer 3: [tenant-context]     (conditional) TenantRegistry lookup + status validation (ACTIVE/SUSPENDED/DELETED)
+Layer 4: [auth]               (conditional) SASL handshake — stores AuthenticatedPrincipal on channel
+Layer 5: [protocol-detector]  (always)     Magic bytes → DetectionResult (timeout: 5s)
+Layer 6: [negotiation]        (always)     Wires protocol-specific codec + handler into pipeline
+Layer 7: [flow-controller]    (always)     Channel-level backpressure management
+Layer 8: [exception-handler]  (always)     Catch-all ServerExceptionHandler
+```
+
+**Key design patterns:**
+- **Conditional insertion:** handlers only added if feature enabled (TLS, multi-tenant, auth)
+- **Self-removing handlers:** `TenantResolverHandler` and `ProtocolNegotiationHandler` remove
+  themselves after first use — minimizes pipeline depth on the hot path
+- **AtomicReference hot-reload:** `SslContext` swapped atomically; in-flight connections keep
+  old context, new connections get new context — zero downtime certificate rotation
+
+### SNI Routing (TLS ClientHello → TenantId)
+
+**Chicken-and-egg problem:** the broker needs `TenantId` to select the per-tenant `SslContext`,
+but `TenantId` is derived from the SNI hostname in the TLS `ClientHello` — which arrives
+**before** the handshake completes.
+
+**Solution:** Java's `ExtendedSSLSession.getRequestedServerNames()` provides SNI extraction
+after the handshake event, without requiring a custom `SniHandler`:
+
+```java
+class TenantResolverHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+        if (evt instanceof SslHandshakeCompletionEvent) {
+            // Extract SNI from TLS session
+            SSLSession session = ctx.pipeline().get(SslHandler.class).engine().getSession();
+            String sniHostname = ((ExtendedSSLSession) session)
+                .getRequestedServerNames().stream()
+                .filter(n -> n instanceof SNIHostName)
+                .map(n -> ((SNIHostName) n).getAsciiName())
+                .findFirst().orElse(null);
+
+            // Deterministic UUID derivation (RFC 4122 v3, MD5 name-based)
+            // "acme.broker.example.com" → subdomain "acme" → UUID
+            String subdomain = sniHostname.split("\\.")[0];
+            TenantId tenantId = new TenantId(UUID.nameUUIDFromBytes(subdomain.getBytes(UTF_8)));
+
+            ctx.channel().attr(TENANT_KEY).set(tenantId);
+            ctx.pipeline().remove(this);  // self-remove after resolution
+        }
+    }
+}
+```
+
+**Per-tenant SslContext pool:**
+```java
+class SslContextPool {
+    // tenantId → current SslContext (swapped atomically on cert reload)
+    ConcurrentHashMap<TenantId, AtomicReference<SslContext>> pool;
+
+    void updateSslContext(TenantId tenantId, SslContext newCtx) {
+        AtomicReference<SslContext> ref = pool.get(tenantId);
+        SslContext old = ref.getAndSet(newCtx);        // atomic swap
+        ReferenceCountUtil.safeRelease(old);            // OpenSSL ref counting
+    }
+}
+```
+
+### Protocol Detection (Magic Bytes)
+
+`ProtocolDetector` extends `ByteToMessageDecoder` and matches incoming bytes against ordered rules:
+
+| Confidence | Protocol | Magic Bytes / Pattern |
+|-----------|----------|----------------------|
+| EXACT | AMQP 0-9-1 | `AMQP\x00\x00\x09\x01` (8 bytes) |
+| EXACT | AMQP 1.0 | `AMQP\x00\x01\x00\x00` (8 bytes) |
+| EXACT | AMQP 1.0 SASL | `AMQP\x03\x01\x00\x00` (8 bytes) |
+| HIGH | NATS | `"CONNECT "` or `"INFO "` prefix |
+| HIGH | STOMP | `"STOMP\n"` or `"CONNECT\n"` |
+| HIGH | HTTP | `"GET "`, `"POST "`, `"PUT "`, etc. |
+| HIGH | Kafka | 4-byte len + API key ∈ [0-74] + version ∈ [0-16] |
+| HIGH | MQTT | Fixed header: type ∈ [1-14] + flag validation |
+| HIGH | PgWire | 4-byte len + version 196608 (3.0) |
+| MEDIUM | Redis | Starts with `+`, `-`, `:`, `$`, `*` |
+| LOW | MySQL | Greeting byte 0x0a at offset 4 |
+
+**Key:** First match wins; no backtracking. RMQ Streams checked before Kafka (both have 4-byte
+frame length; RMQ Streams' `0x000F` command key distinguishes).
+
+After detection, `ProtocolNegotiationHandler` looks up the `ProtocolBundle` via `ServiceLoader`
+and wires the protocol-specific codec + handler into the pipeline:
+
+```java
+void onProtocolDetected(DetectionResult result) {
+    ProtocolBundle bundle = ProtocolBundleRegistry.lookup(result.protocolId());
+    pipeline.addBefore("flow-controller", "codec", bundle.codec().decoder(codecContext));
+    pipeline.addBefore("flow-controller", "encoder", bundle.codec().encoder(codecContext));
+    pipeline.addBefore("flow-controller", "handler", bundle.handler());
+    pipeline.remove("protocol-detector");
+    pipeline.remove("negotiation");
+}
+```
+
+---
+
+## Phase B: Security Pipeline (8 Layers)
+
+> Full details in [SECURITY.md](SECURITY.md). Summary here for pipeline context.
+
+After Netty pipeline assembly, every operation passes through the security layers:
+
+| Layer | Module | What It Does |
+|-------|--------|-------------|
+| 0 | ivy-server | Connection metadata logging (IP, port, timestamp) — never rejects |
+| 1 | ivy-server | TLS 1.2+ mandatory; cipher suite enforcement (AES-GCM only) |
+| 2 | ivy-server | SNI → TenantId; reject if SUSPENDED/DELETED |
+| 3 | ivy-auth | Connection quota (max connections per tenant); per-IP rate limiting |
+| 4 | ivy-codec | SASL: SCRAM-SHA-256/512, OAUTHBEARER (JWT), PLAIN, DELEGATION_TOKEN, mTLS |
+| 5 | ivy-auth | PrincipalResolverChain: raw auth → ResolvedIdentity (user mapping, groups) |
+| 6 | ivy-auth | ACL authorization: DENY-first, protocol-scoped, Caffeine-cached |
+| 7 | ivy-auth | Token-bucket quotas: produce/consume byte rate, request rate |
+| 8 | ivy-auth | Audit: structured JSON events → PG `audit_log` table |
+
+**Security Epoch check** (Rule R33): before every `BrokerEngine` operation, `SecurityEpochRegistry.checkValid(ctx)` verifies `authEpoch >= max(tenantEpoch, principalEpoch)`. Cost: ~2-4ns.
+
+---
+
+## Phase C: Transformation Pipeline
+
+### Payload Abstraction (Dual-View)
+
+Messages arrive as binary (Kafka, MQTT) or JSON (HTTP, PgWire). The transformation pipeline
+needs JSON; storage needs bytes. `Payload` provides both with lazy conversion:
+
+```java
+sealed interface Payload permits BinaryPayload, JsonPayload {
+    byte[] asBytes();       // zero-cost for BinaryPayload; serializes for JsonPayload
+    JsonNode asJson();      // zero-cost for JsonPayload; parses for BinaryPayload
+    int sizeBytes();        // for quota accounting
+}
+
+record BinaryPayload(byte[] data) implements Payload {
+    // asBytes() → data (zero-cost); asJson() → ObjectMapper.readTree(data) (on demand)
+}
+record JsonPayload(JsonNode node) implements Payload {
+    // asJson() → node (zero-cost); asBytes() → ObjectMapper.writeValueAsBytes(node) (on demand)
+}
+```
+
+### Message Pipeline Types (Compiler-Enforced Ordering)
+
+```java
+record RawMessage(TopicName topic, PartitionIndex requestedPartition, Key key,
+    Payload value, Map<String,String> headers, Timestamp timestamp,
+    ProducerIdentity producerId, SequenceNumber seq, TransactionId txnId)
+
+record TransformedMessage(/* same fields — key/value/headers may differ */)
+
+record LocalResolvedTransformedMessage(/* + PartitionId pid, PartitionIndex idx */)
+record RemoteResolvedTransformedMessage(/* + BrokerId target, LeaderEpoch epoch */)
+
+record PartitionedResolvedBatch(
+    LocalResolvedTransformedBatch local,
+    RemoteResolvedTransformedBatch remote)
+```
+
+`Resolver.resolve()` accepts ONLY `TransformedMessage` — compiler prevents resolving before
+transforming.
+
+### TransformStep Interface
+
+```java
+interface TransformStep {
+    TransformResult apply(SecurityContext ctx, TransformedMessage msg);
+    boolean modifiesKey();   // true → skipped for transactional writes
+}
+
+sealed interface TransformResult {
+    record Transformed(TransformedMessage msg) implements TransformResult {}
+    record RouteToDeadLetter(TransformedMessage msg, String reason) implements TransformResult {}
+    record Rejected(String reason) implements TransformResult {}
+}
+```
+
+### Concrete Steps
+
+| Step | `modifiesKey()` | Description |
+|------|----------------|-------------|
+| `SchemaValidationStep` | `false` | Validate against Avro/JSON/Protobuf schema (tenant-scoped) |
+| `DataMaskingStep` | `false` | Mask PII fields (e.g., `email` → `***@***.com`) |
+| `FieldEncryptionStep` | `false` | Encrypt fields with tenant KMS key |
+| `JsonataTransformStep` | **`true`** | JSONata expression restructure; may produce new key |
+| `HeaderEnrichmentStep` | `false` | Inject metadata headers (source protocol, tracing, timestamp) |
+
+### Pipeline Execution
+
+```java
+class TransformationPipeline {
+    List<TransformedMessage> execute(SecurityContext ctx, List<RawMessage> batch) {
+        List<TransformedMessage> result = new ArrayList<>(batch.size());
+        for (RawMessage raw : batch) {
+            TransformedMessage msg = TransformedMessage.from(raw);
+            boolean accepted = true;
+            for (TransformStep step : steps) {
+                // Transactional key-skip: key was part of AddPartitionsToTxn
+                if (msg.txnId() != null && step.modifiesKey()) continue;
+                switch (step.apply(ctx, msg)) {
+                    case Transformed t        -> msg = t.msg();
+                    case RouteToDeadLetter d  -> { dlqRouter.route(d); accepted = false; }
+                    case Rejected r           -> { log.warn(r.reason()); accepted = false; }
+                }
+                if (!accepted) break;
+            }
+            if (accepted) result.add(msg);
+        }
+        return result;
+    }
+}
+```
+
+**NoOpPipeline:** singleton zero-cost default when no transforms configured. Checked via identity
+equality before invocation: `if (pipeline != NoOpPipeline.INSTANCE) pipeline.execute(...)`.
+
+**SecurityContext propagation:** every step receives `SecurityContext` — tenant-scoped schema
+lookup, authorized routing, trusted header enrichment (reads tenantId/principal from ctx, NOT
+from message — prevents spoofing).
 
 ---
 
@@ -389,6 +645,41 @@ Owner broker:
 Non-owner broker:
   8. Return WriteResult to protocol handler → ACK to client
 ```
+
+### Forwarder (Batch-by-Broker RPC)
+
+The `Forwarder` groups messages by target broker to minimize RPC round-trips:
+
+```java
+class Forwarder {
+    List<OperationResult<WriteResult>> forward(SecurityContext ctx,
+            RemoteResolvedTransformedBatch batch) {
+        // Group by targetBroker: 100 msgs to 3 brokers = 3 RPCs (not 100)
+        Map<BrokerId, List<RemoteResolvedTransformedMessage>> byBroker =
+            batch.messages().stream()
+                .collect(Collectors.groupingBy(m -> m.targetBroker()));
+
+        List<OperationResult<WriteResult>> results = new ArrayList<>();
+        for (var entry : byBroker.entrySet()) {
+            try {
+                ForwardWriteResponse resp = rpcClient.send(
+                    entry.getKey(), ForwardWriteRequest.from(ctx, entry.getValue()));
+                results.addAll(resp.toOperationResults());
+            } catch (RpcException e) {
+                // RPC failure → StorageError for each message in this broker's batch
+                entry.getValue().forEach(msg ->
+                    results.add(OperationResult.failure(new StorageError(e))));
+            }
+        }
+        return results;  // same order as input messages
+    }
+}
+```
+
+**Key properties:**
+- One RPC per broker, not per message (amortizes network overhead)
+- No retry in Forwarder — protocol handler decides retry policy
+- RPC failure → `StorageError` for every message destined for that broker
 
 ### ForwardWriteRequest / ForwardWriteResponse
 

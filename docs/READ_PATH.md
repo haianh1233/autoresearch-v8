@@ -68,6 +68,59 @@ immediately submits to a virtual thread executor and returns a `CompletableFutur
 
 ## ReadAccumulator
 
+### 10-Step Per-Partition Read Pipeline
+
+```
+fetchPartition(partitionId, fetchOffset, maxRecords, maxBytes, isolation):
+
+  Step 1.  HWM bound check — if fetchOffset > highWatermark → return EMPTY
+  Step 2.  Tier 1: LogSegment lookup (ConcurrentSkipListMap.floorEntry)
+  Step 3.  OffsetIndex binary search within segment → file position
+  Step 4.  FileChannel.read() from position → raw entries
+  Step 5.  HWM re-check — filter entries with offset >= hwm (may have advanced mid-read)
+  Step 6.  IsolationFilter (4-gate chain): tenant, control, LSO, aborted ranges
+  Step 7.  Record count limit (maxRecords)
+  Step 8.  Byte size limit (maxBytes)
+  Step 9.  If empty → Tier 3: PG fetchRange + populate Tier 1 (read-through caching)
+  Step 10. Assemble ReadResult (entries, hwm, lso, hitTier)
+```
+
+```java
+class ReadAccumulator {
+    final LogSegmentStore logSegments;              // Tier 1
+    final PostgresStorageEngine pgStorage;          // Tier 3
+    final ComposedIsolationFilter filter;           // 4-gate chain
+    final LsoTracker lsoTracker;                    // per-partition LSO
+    final ConcurrentHashMap<PartitionId, AtomicLong> hwmMap;
+
+    ReadResult fetchPartition(PartitionId pid, long fetchOffset,
+            int maxRecords, int maxBytes, IsolationLevel isolation) {
+
+        long hwm = hwmMap.getOrDefault(pid, new AtomicLong(0)).get();
+        if (fetchOffset > hwm) return ReadResult.EMPTY;            // Step 1
+
+        var entries = logSegments.read(pid, fetchOffset, maxRecords); // Steps 2-4
+
+        hwm = hwmMap.get(pid).get();                               // Step 5
+        entries = entries.stream().filter(e -> e.offset() < hwm).toList();
+
+        long lso = lsoTracker.getLso(pid);
+        entries = filter.apply(entries, pid, tenantId, isolation, lso); // Step 6
+        entries = applyLimits(entries, maxRecords, maxBytes);        // Steps 7-8
+
+        if (entries.isEmpty() && fetchOffset < hwm) {              // Step 9
+            entries = pgStorage.fetchRange(pid, fetchOffset, maxRecords);
+            logSegments.populateCache(pid, entries);  // read-through: Tier 3 → Tier 1
+            entries = filter.apply(entries, pid, tenantId, isolation, lso);
+            entries = applyLimits(entries, maxRecords, maxBytes);
+        }
+
+        return new ReadResult(entries, hwm, lso, computeSize(entries),
+            entries.isEmpty() ? Tier.EMPTY : Tier.TIER_1);         // Step 10
+    }
+}
+```
+
 ### Multi-Partition Parallel Reads
 
 A Kafka `FetchRequest` can cover dozens of partitions. Reads are executed in parallel:
@@ -446,6 +499,171 @@ Producer commits (after PG COMMIT):
 For cluster mode: the partition owner's `FlushEventDispatcher` broadcasts a
 `PushNotification` RPC to peer brokers. Each peer wakes its local `SubscriptionRegistry`
 and pushes from its own read cache.
+
+### SubscriptionManager
+
+Per-partition registry of active push subscribers with error-isolated broadcast:
+
+```java
+class SubscriptionManager {
+    // Partition-specific subscriptions
+    ConcurrentHashMap<PartitionId, ConcurrentHashMap<String, Subscription>> subscriptions;
+    // Global subscriptions (MQTT # wildcard, AMQP fanout)
+    ConcurrentHashMap<String, Subscription> globalSubscriptions;
+
+    void subscribe(PartitionId pid, Subscription sub) {
+        subscriptions.computeIfAbsent(pid, k -> new ConcurrentHashMap<>())
+            .put(sub.subscriberId(), sub);
+    }
+
+    void subscribeAll(Subscription sub) {  // MQTT # wildcard
+        globalSubscriptions.put(sub.subscriberId(), sub);
+    }
+
+    void broadcast(PartitionId pid, List<SegmentEntry> entries) {
+        // Partition-specific subscribers
+        var map = subscriptions.get(pid);
+        if (map != null) {
+            for (Subscription sub : map.values()) {
+                try { sub.callback().accept(entries); }
+                catch (Exception e) { log.warn("Subscriber {} failed", sub.subscriberId(), e); }
+            }
+        }
+        // Global subscribers
+        for (Subscription sub : globalSubscriptions.values()) {
+            try { sub.callback().accept(entries); }
+            catch (Exception e) { log.warn("Global subscriber {} failed", sub.subscriberId(), e); }
+        }
+    }
+}
+
+record Subscription(String subscriberId, Consumer<List<SegmentEntry>> callback) {}
+```
+
+**Error isolation:** one subscriber failure does NOT cascade to others — each callback
+wrapped in try-catch. Callbacks must be **fast** (enqueue to protocol channel buffer, not
+process inline) since they run on the dispatcher thread.
+
+### Two-Path Write-Read Notification
+
+After PG COMMIT, consumers are notified via two complementary paths:
+
+```
+Path 1 (FAST, direct, ~0ms):
+  WriteWorker.processBatch() calls directly:
+    → pendingFetchRegistry.notifyWaiters(partitionId)   // wake PULL consumers
+    → subscriptionManager.broadcast(partitionId, entries) // push to MQTT/AMQP
+
+Path 2 (ASYNC, backup, 1-5ms):
+  WriteWorker publishes FlushEvent → MpscArrayQueue
+    → FlushEventDispatcher drains → notifyWaiters (backup)
+    → clusterNotifier.notifyPeers (cluster-wide push)
+```
+
+**Why two paths?**
+- Path 1: sub-millisecond latency for local consumers (critical for Kafka Streams)
+- Path 2: cluster-wide notification + safety net if Path 1 consumer wasn't registered yet
+- Path 2 is the ONLY path that notifies **peer brokers**
+- `notifyWaiters()` is idempotent — calling twice finds no waiters on second call
+
+### Owner-Notifies Model (Cluster Mode)
+
+Non-owner brokers with local subscribers register interest with the partition owner:
+
+```
+SETUP (one-time):
+  ivy-3 has MQTT subscriber for "sensor/temp" → owner is ivy-2
+  ivy-3 → InterBrokerRpc: InterestAdd(partitionId=sensor/temp:0, brokerId=ivy-3)
+  ivy-2 subscription registry: sensor/temp:0 → interested peers: [ivy-3]
+
+RUNTIME (on each write):
+  Producer writes to sensor/temp:0 on ivy-2 (owner)
+  → PG COMMIT
+  → FlushNotification RPC to ivy-3: { partitionId, startOffset, endOffset }
+
+  ivy-3 receives FlushNotification:
+  → Fetch from ivy-2's cache (Tier 2, ~0.5ms inter-broker RPC)
+  → Populate local cache (read-through)
+  → Push to local MQTT subscriber → PUBLISH
+  → Total latency: ~1-3ms after COMMIT
+```
+
+**Interest lifecycle:**
+- `InterestAdd` sent on first local subscriber for a remote partition
+- `InterestRemove` sent when last local subscriber disconnects
+- Owner crash → re-register with new owner after HRW recomputation
+
+### Cross-Protocol Fan-Out
+
+Multiple protocols can subscribe to the same partition:
+
+```
+Kafka producer writes to "events:0" (owner: ivy-1)
+  → SubscriptionManager on ivy-1:
+      events:0 → [mqtt-sub-1 (MQTT PUBLISH), amqp-consumer-1 (basic.deliver)]
+  → broadcast delivers to BOTH:
+      mqtt-sub-1:     entries → MqttPublishEncoder → PUBLISH QoS 1
+      amqp-consumer-1: entries → AmqpBasicDeliverEncoder → basic.deliver
+```
+
+---
+
+## Backfill Integration
+
+When a read misses Tier 1 and falls through to Tier 3 (PG), the `BackfillScheduler` is notified
+to proactively populate the gap in Tier 1. See [STORAGE.md](STORAGE.md) §BackfillScheduler.
+
+```
+ReadAccumulator Step 9 (Tier 3 fallback):
+  records = pgStorage.fetchRange(pid, offset, maxRecords)
+  logSegments.populateCache(pid, records)           // immediate read-through
+  backfillScheduler.request(pid, offset, hwm)       // schedule wider gap fill
+```
+
+The backfill runs asynchronously on virtual threads with semaphore-gated concurrency (max 16
+concurrent PG queries). This ensures that subsequent reads for the same offset range hit Tier 1.
+
+---
+
+## Cache Warming After Leadership Transfer
+
+When a partition changes ownership, the new owner's Tier 1 cache is cold:
+
+```
+t=0s     New leader claims partition (HRW recompute, CAS claim in PG)
+t=0-3s   COLD: all reads hit Tier 3 (PG, ~2-5ms)
+t=3s+    New writes → LogSegment populated post-ACK (hot tip warms)
+t=10s+   Consumer reads → read-through caching fills gaps in Tier 1
+t=60s+   FULLY WARM: all active consumer offset ranges cached (~0.1ms)
+```
+
+**Proactive warming** (optional): on leadership claim, prefetch last N records from PG:
+
+```yaml
+storage:
+  log-segments:
+    proactive-warm-on-leadership: true
+    warm-ahead-records: 10000
+    max-warm-bytes-per-partition: 67108864   # 64 MB cap
+```
+
+---
+
+## Read Metrics
+
+```
+ivy_read_latency_ns              Histogram   Per-tier latency (tags: tier={segment|owner_rpc|pg})
+ivy_read_records_total           Counter     Records read per tier
+ivy_read_bytes_total             Counter     Bytes read
+ivy_cache_hit_ratio              Gauge       Tier 1 hit rate (0.0-1.0)
+ivy_longpoll_wait_ms             Histogram   Long-poll duration (tags: outcome={data|timeout})
+ivy_longpoll_active              Gauge       Currently registered long-poll waiters
+ivy_push_notification_latency_ms Histogram   PG COMMIT to subscriber delivery
+ivy_push_subscribers_active      Gauge       Active push subscribers per partition
+ivy_consumer_lag                 Gauge       HWM - committed offset per (group, partition)
+ivy_backfill_requests_total      Counter     BackfillScheduler requests
+ivy_read_through_cache_fills     Counter     Tier 3 → Tier 1 cache population events
+```
 
 ---
 

@@ -322,6 +322,191 @@ void drainAll(Duration timeout) {
 Unflushed records at shutdown are safe: they are in PG (WriteWorker committed before ACK).
 The local LogSegment file will be re-flushed on next startup from PG.
 
+### Flush Circuit Breaker
+
+Protects PG from cascading failure when the database is overloaded or unreachable:
+
+```
+State machine:
+CLOSED → (5 consecutive failures) → OPEN → (cooldown elapsed) → HALF_OPEN
+HALF_OPEN → (success) → CLOSED (with ramp-up)
+HALF_OPEN → (failure) → OPEN (extended cooldown)
+```
+
+**Cooldown escalation:** 200ms → 1s → 5s → 30s max (with ±25% jitter per interval).
+
+**Ramp-up after recovery:** When circuit closes, flush rate ramps gradually:
+25% → 50% → 75% → 100% throughput over 4 flush cycles. Prevents re-opening the circuit
+by flooding PG immediately after recovery.
+
+**Bypass on shutdown:** `drainAll()` passes `bypassCircuitBreaker=true` to ensure all sealed
+segments get flushed before the broker shuts down, regardless of circuit state.
+
+---
+
+## Crash Recovery
+
+### CRC32C Validation
+
+Every log segment record includes a CRC32C checksum over the data portion:
+
+```java
+// On write:
+CRC32C crc = new CRC32C();
+crc.update(dataBytes);
+int checksum = (int) crc.getValue();
+// Written: [offset:8][dataLen:4][crc32c:4][data:N]
+
+// On read:
+CRC32C crc = new CRC32C();
+crc.update(readDataBytes);
+if ((int) crc.getValue() != expectedCrc) {
+    throw new CorruptSegmentException(offset, expectedCrc, actualCrc);
+}
+```
+
+### Partial Write Detection
+
+A crash during `LogSegment.append()` leaves an incomplete record at the end of the `.log` file.
+On restart, the segment scanner detects this:
+
+1. Read entry envelope (16 bytes: offset + dataLen + crc32c)
+2. If `dataLen` extends beyond file EOF → partial write → truncate to last complete entry
+3. If data reads fully but CRC doesn't match → corrupt entry → truncate to previous entry
+4. Segment truncated to last valid record; no data loss (PG is authoritative)
+
+### PG-Authoritative Recovery
+
+After segment scan, compare local state with PG:
+
+```
+For each owned partition:
+  localHwm = max(offset) across all local segments
+  pgHwm    = SELECT next_offset FROM partition_offsets WHERE partition_id = ?
+
+  if (localHwm < pgHwm):
+    // Gap: PG has data that local cache doesn't
+    // Trigger BackfillScheduler to load missing range
+    backfillScheduler.request(partitionId, localHwm, pgHwm)
+
+  if (localHwm > pgHwm):
+    // Should NEVER happen (PG COMMIT before ACK, before segment write)
+    // Log WARNING, truncate local segment to pgHwm
+    log.warn("Local HWM {} > PG HWM {} for partition {}", localHwm, pgHwm, pid);
+    logSegmentStore.truncateTo(pid, pgHwm);
+```
+
+---
+
+## BackfillScheduler
+
+Loads missing data from PG into local LogSegments. Used for startup recovery, leadership
+transfer warming, and read-through cache population.
+
+### Architecture
+
+```
+ReadAccumulator (cache miss) ─┐
+                               ├→ BackfillScheduler ─→ PG fetchRange ─→ LogSegment.append
+Startup Recovery ─────────────┘
+```
+
+### Batched Cross-Partition Backfill
+
+Single consumer thread batches requests across partitions for efficient PG queries:
+
+```java
+class BackfillScheduler {
+    MpscArrayQueue<BackfillRequest> requestQueue;   // lock-free producer queue
+    Semaphore concurrencyGate = new Semaphore(16);  // max 16 in-flight PG queries
+
+    void run() {
+        while (!shutdown) {
+            List<BackfillRequest> batch = drainUpTo(50);  // max 50 partitions per batch
+            if (batch.isEmpty()) {
+                LockSupport.parkNanos(500_000);  // 500µs park
+                continue;
+            }
+            concurrencyGate.acquire();
+            virtualThread(() -> {
+                try {
+                    for (BackfillRequest req : batch) {
+                        List<MessageRecord> records = pgStorage.fetchRange(
+                            req.partitionId, req.fromOffset, req.toOffset);
+                        logSegmentStore.appendAll(req.partitionId, records);
+                        req.waiter.complete(true);  // wake blocked consumers
+                    }
+                } finally {
+                    concurrencyGate.release();
+                }
+            });
+        }
+    }
+}
+```
+
+### Flush Triggers
+
+| Trigger | Default | Description |
+|---------|---------|-------------|
+| Partition count | ≥50 | Enough requests to justify batch PG query |
+| Linger time | ≥2ms | Don't wait too long for more requests |
+| Estimated size | ≥8MB | Prevent excessively large single queries |
+
+### PartitionBackfill (Per-Partition Range State)
+
+```java
+class PartitionBackfill {
+    TreeMap<Long, Long> pendingRanges;     // offset ranges needing query
+    TreeMap<Long, Long> inFlightRanges;    // currently being queried
+    TreeMap<Long, Long> completedRanges;   // successfully backfilled
+
+    // Interval merging: [0,100) + [100,200) → [0,200)
+    void addRange(long from, long to) {
+        pendingRanges.merge(from, to, Math::max);
+        mergeAdjacentRanges(pendingRanges);
+    }
+
+    // Subtract in-flight from pending (avoid redundant queries)
+    TreeMap<Long, Long> nextPendingRanges() {
+        return subtract(pendingRanges, inFlightRanges);
+    }
+}
+```
+
+### MAX_REBUILD_BYTES
+
+Default: **64 MB per partition**. If a gap exceeds this, backfill runs in multiple rounds:
+
+```
+Round 1: fetch [localHwm, localHwm + 64MB) from PG → append to segment
+Round 2: fetch [localHwm + 64MB, localHwm + 128MB) from PG → append to segment
+...
+Until gap is closed or consumer reads trigger lazy backfill for remaining ranges
+```
+
+### Cache Warming After Leadership Transfer
+
+```
+t=0s     New leader claims partition (HRW recompute, CAS claim in PG)
+t=0-3s   COLD: all reads go to PG (Tier 3, ~2-5ms latency)
+t=3s+    New writes arrive → LogSegment populated post-ACK (hot tip warms)
+t=10s+   Consumer reads for recent offsets → read-through caching fills gaps
+t=60s+   FULLY WARM: all active consumer offset ranges cached (~0.1ms)
+```
+
+**Proactive warming** (optional, configurable):
+```yaml
+storage:
+  log-segments:
+    proactive-warm-on-leadership: true
+    warm-ahead-records: 10000          # prefetch last N records from PG
+    max-warm-bytes-per-partition: 67108864   # 64 MB cap
+```
+
+On leadership claim, the broker proactively fetches the last 10K records from PG
+and appends them to the local segment cache before the first consumer arrives.
+
 ---
 
 ## SegmentCleaner
