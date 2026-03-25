@@ -167,8 +167,11 @@ com.ivy.broker/
                   DeliveryTracker
   transaction/  — TransactionCoordinator, ProducerStateManager, TransactionRepository,
                   ControlRecordWriter
-  auth/         — DefaultAuthEngine (implements AuthEngine), ScramAuthenticator, AclStore,
-                  AclAuthorizer, TokenBucketQuotaManager
+  auth/         — DefaultAuthEngine (implements AuthEngine), ScramAuthenticator (tenant-scoped),
+                  AclStore (tenant + protocol-scoped, deny-first), AclAuthorizer,
+                  TokenBucketQuotaManager (per-tenant/per-user), TenantSqlIsolation
+  internal/     — TenantStore (__tenants cache), TenantEntry, CredentialStore, AclStore,
+                  QuotaStore (all compacted-topic backed, replayed on startup)
   cluster/      — HRWRouter, MetadataImage, MetadataImageHolder, MetadataPoller,
                   ClusterManager, HeartbeatWriter, HeartbeatMonitor,
                   BrokerFencingPipeline, ForwardWriteManager,
@@ -447,18 +450,38 @@ META-INF/services/com.ivy.common.protocol.ProtocolBundle:
 ### Package Structure
 ```
 com.ivy.server/
-  BrokerMain.java              — entry point, manual IoC assembly (no DI framework)
-  NettyBrokerServer.java       — Netty ServerBootstrap, EventLoopGroup lifecycle
-  NettyPipelineFactory.java    — builds per-connection pipeline using ProtocolBundleRegistry
-  ProtocolDetector.java        — peeks first 8 bytes, selects ProtocolBundle
-  TenantResolverHandler.java   — SNI hostname → TenantId
-  ConnectionLimitHandler.java  — max connections per tenant
-  FlowControlHandler.java      — channel backpressure (high/low watermarks)
-  ServerExceptionHandler.java  — catch-all, log + graceful close
-  GracefulShutdown.java        — drain → release partitions → close connections → exit
-  BrokerConfigWatcher.java     — hot-reload YAML config
+  BrokerMain.java                    — entry point, manual IoC assembly (no DI framework)
+  NettyBrokerServer.java             — Netty ServerBootstrap, EventLoopGroup lifecycle
+  NettyPipelineFactory.java          — builds per-connection pipeline using ProtocolBundleRegistry
+  ProtocolDetector.java              — peeks first 8 bytes, selects ProtocolBundle
+  FlowControlHandler.java            — channel backpressure (high/low watermarks)
+  ServerExceptionHandler.java        — catch-all, log + graceful close
+  GracefulShutdown.java              — drain → release partitions → close connections → exit
+  BrokerConfigWatcher.java           — hot-reload YAML config
+
+  tenant/
+    SniTenantResolver.java           — SNI hostname → deterministic TenantId (no interface, final)
+    TenantResolverHandler.java       — Netty handler: TLS SNI extraction → channel attr
+    TenantContextHandler.java        — Netty handler: TenantRegistry lookup + status enforcement
+    TenantRegistry.java              — dual-indexed cache: by TenantId + by SNI hostname
+    TenantRecord.java                — identity + status + config + audit timestamps
+    TenantLifecycleManager.java      — create / activate / suspend (8 steps) / delete (10 steps)
+    TenantConfig.java                — per-tenant overrides: TLS, auth, quotas, namespace
+    TlsTenantConfig.java             — per-tenant cert + key + CA + mTLS mode
+    AuthTenantConfig.java            — per-tenant SASL mechanisms + OAuth config
+    QuotaTenantConfig.java           — per-tenant byte/request/connection rate limits
+    TenantPersistence.java           — interface: save/load from __tenants internal topic
+    InMemoryTenantPersistence.java   — implementation backed by TenantStore
+    TenantConfigLoader.java          — parses broker.yaml tenants: section
+
   suspension/
-    SuspensionManager.java     — per-tenant broker suspension
+    TenantSuspensionService.java     — interface: 8 suspension operations
+    DefaultTenantSuspensionService.java — coordinates drain + flush + purge
+    TenantChannelRegistry.java       — tracks active channels per tenant + drainTenant()
+
+  tls/
+    SslContextPool.java              — ConcurrentHashMap<TenantId, AtomicReference<SslContext>>
+    CertificateWatcher.java          — hot-reload certs without dropping connections
 ```
 
 ### BrokerMain Assembly

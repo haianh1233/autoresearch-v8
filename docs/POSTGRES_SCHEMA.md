@@ -8,6 +8,30 @@ LogSegment is an async read cache populated after ACK.
 
 ## Tables
 
+### tenants
+Persistent registry of all known tenants. Replayed into `TenantRegistry` on startup.
+
+```sql
+CREATE TABLE tenants (
+  tenant_id    UUID        PRIMARY KEY,
+  sni_hostname TEXT        NOT NULL UNIQUE,
+  status       TEXT        NOT NULL CHECK (status IN ('ACTIVE','SUSPENDED','DELETED')),
+  config       JSONB       NOT NULL DEFAULT '{}',  -- TlsTenantConfig, AuthTenantConfig, QuotaTenantConfig
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_tenants_hostname ON tenants(sni_hostname);
+CREATE INDEX idx_tenants_status   ON tenants(status);
+```
+
+**Notes:**
+- `status = 'DELETED'` rows are retained for 7 days then purged by `TenantPurgeJob`
+- `config` is nullable per-tenant override; missing keys fall back to broker defaults
+- `sni_hostname` is the full SNI hostname (e.g. `acme.broker.example.com`), not just the subdomain
+
+---
+
 ### broker_registry
 Tracks every broker in the cluster. Updated via heartbeat.
 
@@ -294,12 +318,23 @@ CREATE INDEX idx_acl_entries_lookup ON acl_entries(tenant_id, principal, resourc
 
 These topics use `cleanup_policy = 'compact'` — only the latest value per key is retained.
 
-| Topic Name | Key | Value | Purpose |
-|------------|-----|-------|---------|
-| `__consumer_offsets` | `group_id:partition_id` | committed offset | Consumer offset storage |
-| `__consumer_groups` | `group_id:tenant_id` | group state JSON | Group metadata |
-| `__transactions` | `txn_id:tenant_id` | transaction state JSON | Transaction log |
-| `__schemas` | `subject:version` | schema JSON | Schema registry |
+**All internal topic keys are prefixed with `tenantId + ":"`.** This prevents the scoping bug
+found in earlier designs where bare keys caused `__consumer_offsets` to be shared across tenants.
+
+| Topic Name | Key Format | Value | Purpose |
+|------------|------------|-------|---------|
+| `__tenants` | `tenantId` | TenantEntry binary | Tenant registry (global, system-scoped) |
+| `__consumer_offsets` | `tenantId:groupId:partitionId` | committed offset | Per-tenant consumer offsets |
+| `__consumer_groups` | `tenantId:groupId` | group state JSON | Per-tenant group metadata |
+| `__transactions` | `tenantId:txnId` | transaction state JSON | Per-tenant transaction log |
+| `__producer_states` | `tenantId:producerId:partitionId` | producer state binary | Per-tenant idempotent state |
+| `__credentials` | `tenantId:username` | SCRAM hashes binary | Per-tenant credentials |
+| `__acl_entries` | `tenantId:resourceType:resourceName:principal:op` | allow/deny binary | Per-tenant ACLs |
+| `__schemas` | `tenantId:subject:version` | schema JSON | Per-tenant schema registry |
+
+**Critical:** The `tenantId:` prefix in every key is mandatory.
+A bare `groupId` key for `__consumer_offsets` would allow one tenant to read or overwrite
+another tenant's committed offsets. This is enforced by `TenantSqlIsolation` at build time.
 
 ---
 

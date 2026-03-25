@@ -24,6 +24,7 @@ A focused, production-quality multi-protocol message broker.
 | [POSTGRES_SCHEMA.md](docs/POSTGRES_SCHEMA.md) | Full PostgreSQL schema with DDL |
 | [STORAGE.md](docs/STORAGE.md) | LogSegment format, OffsetIndex, StorageFlusher |
 | [IMPLEMENTATION_PHASES.md](docs/IMPLEMENTATION_PHASES.md) | 5-phase build plan with task checklists |
+| [MULTI_TENANT.md](docs/MULTI_TENANT.md) | SNI resolution, partition isolation, tenant lifecycle, per-tenant TLS/auth/quotas |
 | [RULES.md](docs/RULES.md) | Invariants enforced across the codebase |
 
 ## Module Structure
