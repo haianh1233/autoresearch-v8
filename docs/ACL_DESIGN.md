@@ -17,7 +17,7 @@ ALLOW entry. No implicit permissions exist, even for authenticated principals.
 ```java
 record AclEntry(
     TenantId tenantId,
-    ResourceType resourceType,     // TOPIC, GROUP, CLUSTER, TRANSACTIONAL_ID
+    ResourceType resourceType,     // see Per-Protocol Resource Types table
     String resourceName,           // "orders", "payment-*", "*"
     AclPatternType patternType,    // LITERAL or PREFIXED
     String principal,              // "User:alice", "Group:admins", "*"
@@ -27,6 +27,20 @@ record AclEntry(
     ProtocolId protocol            // KAFKA, MQTT, AMQP, etc. (protocol-scoped)
 )
 ```
+
+### Per-Protocol Resource Types
+
+| Protocol | Resource Types | Notes |
+|----------|---------------|-------|
+| Kafka | TOPIC, GROUP, CLUSTER, TRANSACTIONAL_ID, DELEGATION_TOKEN | Standard Kafka ACL model |
+| MQTT | TOPIC, SUBSCRIPTION | SUBSCRIPTION for `$share/group/topic` shared subs |
+| AMQP 0-9-1 | EXCHANGE, QUEUE, VHOST | VHOST maps to tenant; EXCHANGE and QUEUE are separate resources |
+| AMQP 1.0 | TOPIC, LINK | LINK for per-link Attach authorization (sender vs receiver) |
+| HTTP | TOPIC | REST endpoints map to topic operations |
+| MySQL/PgWire | TOPIC | SELECT on topic = READ |
+
+`ResourceType` is an **open enum** — new protocol resource types can be added without modifying
+existing ACL entries. Unknown resource types are rejected at creation time.
 
 ---
 
@@ -66,6 +80,11 @@ Step 6 — ALLOW check
 
 **Key property:** DENY always wins. A single DENY entry overrides any number of ALLOW entries.
 
+**Host-based cache key rationale:** The `clientAddress` in `AclCacheKey` is REQUIRED to prevent
+host-based ACL bypass. Without it, an ALLOW for `10.0.0.1` gets cached, and clients from
+`10.0.0.2` incorrectly receive the cached ALLOW. Including the address ensures each IP gets
+its own cache entry.
+
 ---
 
 ## Protocol-Scoped ACLs
@@ -80,24 +99,120 @@ AclEntry(tenant=acme, resource=TOPIC:orders, principal=User:alice, op=WRITE, per
 # No MQTT WRITE entry for alice → MQTT publish to "orders" is DENIED
 ```
 
-### Protocol-to-Operation Mapping
+### Cross-Protocol Isolation Rules
 
-| Protocol | Wire Operation | ACL Operation | ACL Resource |
-|----------|---------------|---------------|--------------|
-| Kafka | Produce | WRITE | TOPIC |
-| Kafka | Fetch | READ | TOPIC |
-| Kafka | JoinGroup | READ | GROUP |
-| Kafka | CreateTopics | CREATE | TOPIC |
-| Kafka | DeleteTopics | DELETE | TOPIC |
-| MQTT | PUBLISH | WRITE | TOPIC |
-| MQTT | SUBSCRIBE | READ | TOPIC |
-| AMQP 0-9-1 | Basic.Publish | WRITE | TOPIC |
-| AMQP 0-9-1 | Basic.Consume | READ | TOPIC |
-| AMQP 1.0 | Transfer (sender) | WRITE | TOPIC |
-| AMQP 1.0 | Transfer (receiver) | READ | TOPIC |
-| HTTP | POST /topics/{t}/messages | WRITE | TOPIC |
-| HTTP | GET /topics/{t}/messages | READ | TOPIC |
-| MySQL/PgWire | SELECT | READ | TOPIC |
+1. **No cross-protocol inheritance:** A Kafka WRITE on `payments` does NOT grant MQTT PUBLISH
+   on `payments`. Each protocol has independent ACL entries.
+
+2. **Same user, different protocols:** When `alice` authenticates via Kafka AND MQTT, she gets
+   the same `ResolvedIdentity` (username, groups) but different `AclCacheKey`s:
+   - Kafka: `(acme, alice, TOPIC, payments, WRITE, KAFKA, 10.0.1.1)`
+   - MQTT: `(acme, alice, TOPIC, payments, WRITE, MQTT, 10.0.1.1)`
+   These are independent cache entries with independent ACL evaluations.
+
+3. **Protocol wildcard (`protocol=*`):** A wildcard protocol entry matches ALL protocols.
+   Use sparingly — typically only for DENY rules (e.g., "deny User:bob ALL on TOPIC:* across
+   all protocols"). Wildcard ALLOW rules are checked AFTER protocol-specific rules.
+
+4. **AMQP 0-9-1 resource type mismatch:** AMQP 0-9-1 uses EXCHANGE and QUEUE resource types,
+   not TOPIC. A Kafka ACL on `TOPIC:orders` does NOT apply to AMQP `EXCHANGE:orders` even
+   if the underlying Ivy topic is the same.
+
+5. **Error code mapping:** Each protocol returns its native error when ACL denies:
+
+   | Protocol | Error on ACL DENY |
+   |----------|------------------|
+   | Kafka | `TOPIC_AUTHORIZATION_FAILED` (error code 29) |
+   | AMQP 0-9-1 | `Channel.Close(reply-code=403, reply-text="ACCESS_REFUSED")` |
+   | AMQP 1.0 | `Detach(error={condition="amqp:unauthorized-access"})` |
+   | MQTT 3.1.1 | `SUBACK(returnCode=0x80 Failure)` or connection close |
+   | MQTT 5.0 | `CONNACK/SUBACK/PUBACK(reasonCode=0x87 Not Authorized)` |
+   | HTTP | `403 Forbidden` with JSON error body |
+   | MySQL | `ERROR 1045 (28000): Access denied for user` |
+   | PgWire | `ErrorResponse(severity=ERROR, code=42501, message="permission denied")` |
+
+### Complete Wire-Operation → ACL Mapping
+
+**Kafka:**
+
+| Wire Operation | ACL Operation | ACL Resource | Notes |
+|---------------|---------------|--------------|-------|
+| Produce | WRITE | TOPIC | Per-topic, per-partition |
+| Fetch | READ | TOPIC | |
+| JoinGroup | READ | GROUP | Consumer group membership |
+| SyncGroup | READ | GROUP | |
+| OffsetCommit | READ | GROUP | |
+| OffsetFetch | DESCRIBE | GROUP | |
+| CreateTopics | CREATE | TOPIC | |
+| DeleteTopics | DELETE | TOPIC | |
+| AlterConfigs | ALTER | TOPIC or CLUSTER | |
+| DescribeConfigs | DESCRIBE | TOPIC or CLUSTER | |
+| CreatePartitions | ALTER | TOPIC | |
+| InitProducerId | WRITE | TRANSACTIONAL_ID | Transactional producers |
+| AddPartitionsToTxn | WRITE | TRANSACTIONAL_ID | |
+| EndTxn | WRITE | TRANSACTIONAL_ID | |
+| CreateDelegationToken | CREATE | DELEGATION_TOKEN | |
+| DescribeAcls | DESCRIBE | CLUSTER | Admin |
+| CreateAcls | ALTER | CLUSTER | Admin |
+| DeleteAcls | ALTER | CLUSTER | Admin |
+
+**AMQP 0-9-1:**
+
+| Wire Operation | ACL Operation | ACL Resource | Notes |
+|---------------|---------------|--------------|-------|
+| Basic.Publish | WRITE | EXCHANGE | Checked against exchange name |
+| Basic.Consume | READ | QUEUE | Checked against queue name |
+| Basic.Get | READ | QUEUE | Synchronous pull |
+| Exchange.Declare | CREATE | EXCHANGE | |
+| Exchange.Delete | DELETE | EXCHANGE | |
+| Exchange.Bind | CREATE | EXCHANGE | Binding requires CREATE on both source and destination |
+| Queue.Declare | CREATE | QUEUE | |
+| Queue.Delete | DELETE | QUEUE | |
+| Queue.Bind | CREATE | QUEUE | |
+| Queue.Unbind | DELETE | QUEUE | |
+| Queue.Purge | DELETE | QUEUE | Destructive operation |
+| Connection.Open(vhost) | READ | VHOST | Vhost maps to tenant namespace |
+| Tx.Select/Commit/Rollback | — | — | No ACL (transaction boundary, not resource operation) |
+| Confirm.Select | — | — | No ACL (feature flag) |
+
+**AMQP 1.0:**
+
+| Wire Operation | ACL Operation | ACL Resource | Notes |
+|---------------|---------------|--------------|-------|
+| Attach(role=sender, target) | WRITE | TOPIC | Checked at Attach time against `target.address` |
+| Attach(role=receiver, source) | READ | TOPIC | Checked at Attach time against `source.address` |
+| Transfer | — | — | No re-check (authorized at Attach) |
+| Disposition | — | — | No re-check (ack/nack/reject) |
+| Begin (session) | — | — | No ACL (session lifecycle) |
+| Detach / End / Close | — | — | No ACL |
+
+**MQTT 3.1.1 / 5.0:**
+
+| Wire Operation | ACL Operation | ACL Resource | Notes |
+|---------------|---------------|--------------|-------|
+| PUBLISH | WRITE | TOPIC | Topic filter checked |
+| SUBSCRIBE | READ | TOPIC | Each topic filter in SUBSCRIBE checked independently |
+| SUBSCRIBE `$share/group/topic` | READ | SUBSCRIPTION | Shared subscriptions use SUBSCRIPTION resource |
+| CONNECT (will topic) | WRITE | TOPIC | Will message authorization at CONNECT time |
+| AUTH (5.0 only) | — | — | Re-auth, not resource access |
+
+**HTTP REST:**
+
+| Wire Operation | ACL Operation | ACL Resource | Notes |
+|---------------|---------------|--------------|-------|
+| POST /topics/{t}/messages | WRITE | TOPIC | |
+| POST /topics/{t}/messages/batch | WRITE | TOPIC | |
+| GET /topics/{t}/messages | READ | TOPIC | Long-poll supported |
+| GET /topics | DESCRIBE | CLUSTER | Metadata |
+| GET /topics/{t} | DESCRIBE | TOPIC | |
+
+**MySQL / PgWire (Read-Only):**
+
+| Wire Operation | ACL Operation | ACL Resource | Notes |
+|---------------|---------------|--------------|-------|
+| SELECT FROM topic | READ | TOPIC | |
+| SHOW TABLES | DESCRIBE | CLUSTER | Metadata |
+| SHOW CREATE TABLE topic | DESCRIBE | TOPIC | |
 
 ---
 

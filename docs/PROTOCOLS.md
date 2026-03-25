@@ -173,7 +173,7 @@ See [RE_AUTH.md](RE_AUTH.md) for the full re-auth design including all protocols
 
 | Class | Method | Notes |
 |-------|--------|-------|
-| Connection | Start, StartOk, Tune, TuneOk, Open, OpenOk, Close, CloseOk | Full handshake |
+| Connection | Start, StartOk, Tune, TuneOk, Open, OpenOk, Close, CloseOk | Full handshake + SASL |
 | Channel | Open, OpenOk, Close, CloseOk | Multi-channel |
 | Exchange | Declare, DeclareOk, Delete, DeleteOk | 4 exchange types |
 | Queue | Declare, DeclareOk, Bind, BindOk, Unbind, UnbindOk, Purge, Delete | Full lifecycle |
@@ -235,6 +235,43 @@ Channel.ConfirmSelect → broker tracks unconfirmed deliveryTags
 Basic.Publish → write to broker → on PG COMMIT → Basic.Ack(deliveryTag, multiple=false)
              → on failure → Basic.Nack(deliveryTag) → client retries
 ```
+
+### Authentication (SASL in Connection Handshake)
+
+```
+S→C: Connection.Start(
+       version-major=0, version-minor=9,
+       mechanisms="PLAIN AMQPLAIN EXTERNAL",
+       locales="en_US",
+       server-properties={product="ivy-broker", version="9.0.0"})
+
+C→S: Connection.StartOk(
+       mechanism="PLAIN",
+       response="\0username\0password",    // SASL PLAIN: \0user\0pass
+       locale="en_US",
+       client-properties={...})
+
+S→C: Connection.Tune(channel-max=2047, frame-max=131072, heartbeat=60)
+C→S: Connection.TuneOk(channel-max=2047, frame-max=131072, heartbeat=60)
+
+C→S: Connection.Open(virtual-host="/")     // vhost → tenant namespace
+S→C: Connection.OpenOk()
+```
+
+**Supported SASL mechanisms:**
+- **PLAIN:** `\0username\0password` — TLS required (Rule R26)
+- **AMQPLAIN:** RabbitMQ extension — `{LOGIN: "user", PASSWORD: "pass"}` field table encoding
+- **EXTERNAL:** mTLS CN extraction — `response` field is empty; identity from cert
+
+**Vhost-to-Tenant Mapping:**
+- `Connection.Open(virtual-host)` parameter maps to tenant namespace
+- Default vhost `/` → default tenant (single-tenant mode)
+- Named vhost (e.g., `acme`) → `TenantId = UUID.nameUUIDFromBytes("acme".getBytes(UTF_8))`
+- Vhost is immutable for the connection lifetime (same as SNI-based tenant)
+- ACL check: `READ` on `VHOST` resource at `Connection.Open` time
+
+**Re-auth:** AMQP 0-9-1 has no in-band re-auth. See [RE_AUTH.md](RE_AUTH.md) §Category C
+(graceful close + reconnect via `Connection.Close(reply-code=320, reply-text="re-authenticate")`).
 
 ---
 
@@ -326,15 +363,74 @@ Receiver → broker: flow(link-credit=50)    ← replenish credit
 | `at-least-once` | settled=false | settles on disposition | At least once (default) |
 | `exactly-once` | settled=false | coordinates with sender | Two-phase settlement |
 
-### SASL (connection-level)
+### SASL Layer (Separate Frame Type)
 
-AMQP 1.0 uses a SASL exchange before the AMQP open frame:
+AMQP 1.0 uses a **separate SASL frame layer** (type `0x01`) BEFORE the AMQP Open performative.
+SASL frames use a different frame type byte than AMQP frames (`0x00`):
+
 ```
-S→C: sasl-mechanisms([PLAIN, SCRAM-SHA-256])
-C→S: sasl-init(mechanism=PLAIN, initial-response=\0user\0pass)
-S→C: sasl-outcome(code=OK)
-     — AMQP open frame follows
+SASL frame header:
+  [size:uint32][doff:uint8][type:uint8(0x01)][channel:uint16][sasl-performative...]
+                                    ↑
+                         type 0x01 = SASL frame (vs type 0x00 = AMQP frame)
 ```
+
+**SASL Performative Descriptors:**
+
+| Descriptor | Name | Direction | Purpose |
+|-----------|------|-----------|---------|
+| `0x00000000:0x00000040` | sasl-mechanisms | S→C | Advertise supported mechanisms |
+| `0x00000000:0x00000041` | sasl-init | C→S | Client selects mechanism + initial response |
+| `0x00000000:0x00000042` | sasl-challenge | S→C | Server challenge (SCRAM rounds) |
+| `0x00000000:0x00000043` | sasl-response | C→S | Client response to challenge |
+| `0x00000000:0x00000044` | sasl-outcome | S→C | Auth result (code: 0=OK, 1=AUTH, 2=SYS, etc.) |
+
+**Wire Flow (SASL PLAIN):**
+```
+S→C: [SASL frame] sasl-mechanisms(sasl-server-mechanisms=[PLAIN, SCRAM-SHA-256, EXTERNAL])
+C→S: [SASL frame] sasl-init(mechanism=PLAIN, initial-response=\0user\0pass, hostname="acme.broker.com")
+S→C: [SASL frame] sasl-outcome(code=0)   ← 0 = ok
+     — switch to AMQP frame type 0x00 —
+C→S: [AMQP frame] Open(container-id="client-1", hostname="acme.broker.com")
+S→C: [AMQP frame] Open(container-id="ivy-broker")
+```
+
+**Wire Flow (SASL SCRAM-SHA-256):**
+```
+S→C: sasl-mechanisms([SCRAM-SHA-256, PLAIN])
+C→S: sasl-init(mechanism=SCRAM-SHA-256, initial-response=<client-first-message>)
+S→C: sasl-challenge(challenge=<server-first-message: salt, iterations, nonce>)
+C→S: sasl-response(response=<client-final-message: proof>)
+S→C: sasl-outcome(code=0, additional-data=<server-final: server-signature>)
+     — switch to AMQP frames —
+```
+
+**Supported SASL mechanisms for AMQP 1.0:**
+- **PLAIN:** `\0username\0password` — TLS required
+- **SCRAM-SHA-256/512:** full RFC 5802 multi-step challenge/response
+- **EXTERNAL:** mTLS CN extraction — initial-response is empty
+- **ANONYMOUS:** allowed for pre-auth operations only (maps to `SecurityContext.ANONYMOUS`)
+
+### Per-Link Authorization
+
+AMQP 1.0 authorization happens at **Attach** time, not Transfer time:
+
+```
+Sender link (producer):
+  C→S: Attach(name="sender-1", role=sender, target={address="orders"})
+  → Broker checks: ACL(principal, WRITE, TOPIC, "orders", AMQP10)
+  → If DENIED: Attach(error={condition="amqp:unauthorized-access"})
+  → If ALLOWED: Attach(name="sender-1") — subsequent Transfer frames NOT re-checked
+
+Receiver link (consumer):
+  C→S: Attach(name="receiver-1", role=receiver, source={address="orders"})
+  → Broker checks: ACL(principal, READ, TOPIC, "orders", AMQP10)
+  → If DENIED: Attach(error={condition="amqp:unauthorized-access"})
+  → If ALLOWED: Attach + Flow begins delivery
+```
+
+**No per-Transfer ACL check** — authorization at Attach time is sufficient. The link is
+scoped to a single address, and the address cannot change after Attach.
 
 ### DLQ in AMQP 1.0
 
@@ -408,6 +504,44 @@ willTopic, willPayload, willQos, willRetain
 Published to broker on unexpected disconnect (no DISCONNECT packet received).
 `clientId` prefix is used as the will message key for tracking.
 
+### Authentication
+
+MQTT 3.1.1 authenticates via CONNECT packet fields:
+
+```
+CONNECT fixed header: type=1, flags=0
+CONNECT variable header:
+  Protocol Name: "MQTT" (4 bytes)
+  Protocol Level: 0x04 (3.1.1)
+  Connect Flags: [username][password][willRetain][willQoS][will][cleanSession][reserved]
+  Keep Alive: uint16 (seconds)
+CONNECT payload:
+  Client Identifier: UTF-8 string
+  Will Topic: UTF-8 string (if will flag set)
+  Will Message: bytes (if will flag set)
+  Username: UTF-8 string (if username flag set)
+  Password: bytes (if password flag set)
+```
+
+**Auth flow:**
+```
+C→S: CONNECT(clientId="sensor-1", username="alice", password="secret")
+     → Broker: AuthEngine.authenticate(PLAIN, "alice", "secret", tenantId)
+S→C: CONNACK(sessionPresent=0, returnCode=0)    ← 0 = Connection Accepted
+     OR
+S→C: CONNACK(returnCode=5)                       ← 5 = Not Authorized
+```
+
+**Return codes:** 0=Accepted, 1=Unacceptable protocol, 2=ID rejected, 3=Server unavailable,
+4=Bad credentials, 5=Not authorized.
+
+**Will message authorization:** The will topic is ACL-checked at CONNECT time (not at
+publish time). If the principal lacks WRITE permission on the will topic, CONNECT is rejected
+with return code 5 (Not Authorized). This prevents unauthorized deferred publishes.
+
+**No re-auth:** MQTT 3.1.1 has no server-initiated DISCONNECT and no AUTH packet. Re-auth
+requires TCP close. See [RE_AUTH.md](RE_AUTH.md) §Category C.
+
 ---
 
 ## MQTT 5.0 Protocol (port 1884 / 8884 TLS, or shared 1883 via version byte)
@@ -423,6 +557,58 @@ The version byte in CONNECT (byte[9]) distinguishes them: `0x04` = 3.1.1, `0x05`
 | DISCONNECT now has Reason Code + Properties | — | Client can now send reason code |
 
 All 3.1.1 packet types exist in 5.0 with extended properties sections.
+
+### Enhanced Authentication (AUTH Packet)
+
+MQTT 5.0 adds the AUTH packet (type 15) for multi-step authentication and broker-initiated
+re-authentication. This is the only MQTT version with in-band re-auth (Category A).
+
+**Initial auth with SCRAM-SHA-256:**
+```
+C→S: CONNECT(
+       protocolLevel=0x05,
+       username="alice",
+       authMethod="SCRAM-SHA-256",          ← property 0x15
+       authData=<client-first-message>)     ← property 0x16
+
+S→C: AUTH(reasonCode=0x18,                  ← 0x18 = Continue Authentication
+       authMethod="SCRAM-SHA-256",
+       authData=<server-first-message: salt, iterations, nonce>)
+
+C→S: AUTH(reasonCode=0x18,
+       authData=<client-final-message: proof>)
+
+S→C: CONNACK(reasonCode=0x00,              ← 0x00 = Success
+       authMethod="SCRAM-SHA-256",
+       authData=<server-final: server-signature>)
+```
+
+**Broker-initiated re-auth (after session established):**
+```
+S→C: AUTH(reasonCode=0x19,                  ← 0x19 = Re-authenticate
+       authMethod="SCRAM-SHA-256",
+       authData=<server-challenge>)
+
+C→S: AUTH(reasonCode=0x18,                  ← Continue
+       authData=<client-response>)
+
+S→C: AUTH(reasonCode=0x00,                  ← Success
+       authData=<server-final>)
+```
+
+**On auth failure:**
+```
+S→C: DISCONNECT(reasonCode=0x87)            ← 0x87 = Not Authorized
+     [connection closed]
+```
+
+**Key rules:**
+- `authMethod` in AUTH packets MUST match the `authMethod` in the original CONNECT.
+  Changing mechanism mid-session is not allowed.
+- Supported methods: `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`
+- **Limitation:** Multi-step SCRAM via AUTH is designed but not yet wired
+  (see [RE_AUTH.md](RE_AUTH.md) §Known Limitations #3). Only single-round methods (PLAIN) work
+  for re-auth currently.
 
 ### Key New Features
 

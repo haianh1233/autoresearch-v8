@@ -209,7 +209,9 @@ Consumer nacks / TTL expires / max-retries exceeded
 | PostgreSQL schema | [POSTGRES_SCHEMA.md](POSTGRES_SCHEMA.md) |
 | Protocol details | [PROTOCOLS.md](PROTOCOLS.md) |
 | Dead letter queues | [DEAD_LETTER_QUEUE.md](DEAD_LETTER_QUEUE.md) |
-| Internal load balancer | [INTERNAL_LOAD_BALANCER.md](INTERNAL_LOAD_BALANCER.md) |
+| Internal load balancer (SNI, transform, HRW) | [INTERNAL_LOAD_BALANCER.md](INTERNAL_LOAD_BALANCER.md) |
+| Consumer group coordination | [CONSUMER_GROUPS.md](CONSUMER_GROUPS.md) |
+| Observability & metrics (Prometheus) | [OBSERVABILITY.md](OBSERVABILITY.md) |
 | Module structure | [MODULE_DESIGN.md](MODULE_DESIGN.md) |
 | Implementation rules (R1–R36) | [RULES.md](RULES.md) |
 | Implementation phases | [IMPLEMENTATION_PHASES.md](IMPLEMENTATION_PHASES.md) |
