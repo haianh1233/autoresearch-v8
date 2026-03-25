@@ -1,0 +1,172 @@
+# Ivy Broker — System Overview
+
+## Vision
+
+A focused, production-quality multi-protocol message broker with five protocol adapters
+(Kafka, AMQP, MQTT, MySQL-wire, PgWire), PostgreSQL as the single source of truth,
+HRW-based partition leadership for clustering, and first-class dead letter queues.
+
+Everything is a log. Every protocol writes to the same partitions. Every consumer reads
+from the same offsets. PostgreSQL decides durability; the broker decides routing.
+
+---
+
+## Architecture Layers
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         ivy-server                               │
+│                                                                  │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐ ┌────────┐ │
+│  │  Kafka   │ │   AMQP   │ │   MQTT   │ │  MySQL  │ │PgWire  │ │
+│  │ Handler  │ │ Handler  │ │ Handler  │ │ Handler │ │Handler │ │
+│  └──────────┘ └──────────┘ └──────────┘ └─────────┘ └────────┘ │
+│  NettyPipelineFactory │ ProtocolDetector │ BrokerMain            │
+├──────────────────────────────────────────────────────────────────┤
+│                         ivy-codec                                │
+│  KafkaCodec │ AmqpCodec │ MqttCodec │ MySqlCodec │ PgWireCodec  │
+├──────────────────────────────────────────────────────────────────┤
+│                         ivy-broker                               │
+│  BrokerEngine │ WriteWorker │ ReadAccumulator │ DlqRouter        │
+│  ConsumerGroupCoordinator │ TransactionCoordinator               │
+│  HRWRouter │ ClusterManager │ HeartbeatWriter │ ForwardWriteMgr  │
+│  InterBrokerRpcServer │ InterBrokerRpcClient │ MetadataImage     │
+├──────────────────────────────────────────────────────────────────┤
+│                         ivy-storage                              │
+│  LogSegment (read cache) │ OffsetIndex (mmap) │ StorageFlusher   │
+│  PostgresStorageEngine (source of truth)                         │
+├──────────────────────────────────────────────────────────────────┤
+│                         ivy-common                               │
+│  Branded Types │ Value Records │ Sealed Interfaces               │
+│  BrokerEngine SPI │ StorageEngine SPI │ AuthEngine SPI           │
+└──────────────────────────────────────────────────────────────────┘
+                               │
+              ┌────────────────┴────────────────┐
+              │         PostgreSQL (HA)           │
+              │  messages │ partitions │ topics   │
+              │  broker_registry │ consumer_*     │
+              │  transactions │ dlq_entries       │
+              └──────────────────────────────────┘
+```
+
+---
+
+## Module Dependency Graph
+
+```
+ivy-server
+  └── ivy-codec
+  └── ivy-broker
+        └── ivy-storage
+              └── ivy-common
+        └── ivy-common
+  └── ivy-common
+```
+
+Dependency rules (enforced at build time):
+- `ivy-common` has **zero** external runtime dependencies
+- `ivy-storage` depends only on `ivy-common` + JDBC/HikariCP
+- `ivy-broker` depends on `ivy-common` + `ivy-storage`
+- `ivy-codec` depends only on `ivy-common` + Netty buffer
+- `ivy-server` depends on all modules; it is the assembly point
+
+---
+
+## Data Flow Summary
+
+### Produce (any protocol → stored in PG)
+```
+Client (Kafka/AMQP/MQTT) → Handler → BrokerEngine.write()
+  → HRWRouter: am I the partition owner?
+    YES → WriteAccumulator → WriteWorker → PG COMMIT → ACK → LogSegment (async)
+    NO  → ForwardWriteManager → InterBrokerRpc → owner broker → same path
+```
+
+### Consume (any protocol reading from PG/LogSegment)
+```
+Client (Kafka/AMQP/MQTT) → Handler → BrokerEngine.fetch()
+  → ReadAccumulator:
+      L1: LogSegment (owner's in-memory cache, <1ms)
+      L2: Owner cache via InterBrokerRpc fetch (0.5ms)
+      L3: PostgreSQL fetchRange (2ms fallback)
+  → Return records → Handler encodes in protocol wire format → Client
+```
+
+### SQL Query (MySQL/PgWire — read-only view)
+```
+Client (JDBC/psql) → Handler → SQL parser → View resolver
+  → SELECT from topic    → BrokerEngine.fetch()
+  → SELECT from metadata → direct PG query (topics, partitions, consumer_groups, broker_registry)
+  → SHOW TABLES          → list topics for tenant
+  → Return ResultSet in MySQL/PgWire wire format
+```
+
+### Dead Letter Queue
+```
+Consumer nacks / TTL expires / max-retries exceeded
+  → DlqRouter.route(originalMessage, reason)
+    → inject x-dlq-* headers
+    → BrokerEngine.write() to __dlq.<original-topic>
+    → stored as normal partition → consumable by any protocol
+```
+
+---
+
+## Key Design Decisions
+
+| Decision | Choice | Reason |
+|----------|--------|--------|
+| Storage source of truth | PostgreSQL (PG-first) | ACID durability; ACK only after PG COMMIT |
+| LogSegment role | Async read cache | Performance optimization; not required for correctness |
+| Leadership election | HRW (Rendezvous Hash) | No Raft complexity; deterministic; O(1) lookup |
+| Protocol count | 5 (focused) | Completeness over breadth; avoids conduktor-ivy scope creep |
+| Module count | 5 (clean) | Each module has a single clear responsibility |
+| DLQ | First-class, all 5 protocols | Missing in ivy-v9; essential for AMQP/MQTT semantics |
+| Multi-tenancy | Yes, SNI-based | Essential for SaaS; TenantId scopes all operations |
+| Java version | 26 + `--enable-preview` | Valhalla value classes; matches mature reference projects |
+| SQL protocols | Read-only query view | Observability/debugging; not full messaging endpoints |
+| Transactions | Kafka-style, routed via BrokerEngine | Universal across all protocols |
+| Consensus | PG CAS (epoch fencing) | Replaces Raft; PG is already the source of truth |
+
+---
+
+## Ports
+
+| Protocol | Default Port | TLS Port |
+|----------|-------------|----------|
+| Kafka | 9092 | 9093 |
+| AMQP 0-9-1 | 5672 | 5671 |
+| MQTT 3.1.1 | 1883 | 8883 |
+| MySQL wire | 3306 | 3307 |
+| PgWire | 5432 | 5433 |
+| Inter-broker RPC | 9094 | — |
+| HTTP health/metrics | 8080 | — |
+
+---
+
+## Technology Stack
+
+| Component | Library | Version |
+|-----------|---------|---------|
+| Language | Java | 26 + `--enable-preview` |
+| Network I/O | Netty | 4.2.x |
+| Database | PostgreSQL JDBC | 42.7.x |
+| Connection pool | HikariCP | 6.x |
+| Metrics | Micrometer + Prometheus | 1.14.x |
+| Compression | Zstd, Snappy, LZ4 | latest |
+| Serialization | Jackson | 2.18.x |
+| Build | Maven | 3.9.x |
+| Testing | JUnit 5 + Testcontainers | 5.x / 1.20.x |
+| Concurrency | JCTools | 4.x |
+| Caching | Caffeine | 3.x |
+
+---
+
+## Non-Goals
+
+- Raft / Paxos consensus (HRW + PG CAS is sufficient)
+- ISR (In-Sync Replicas) — PG replication handles durability
+- More than 5 protocols in initial version
+- Schema Registry (can be added later)
+- Multi-cluster federation (single PG cluster scope for now)
+- Built-in Kafka Connect / Streams compatibility beyond wire protocol
