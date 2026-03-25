@@ -15,19 +15,24 @@
 - [ ] `ProtocolId` enum (KAFKA=1, AMQP=2, MQTT=3, MYSQL=4, PGWIRE=5)
 
 ### ivy-storage
-- [ ] `PostgresStorageEngine` — binary COPY append, SELECT fetchRange, highWatermark
-- [ ] `SchemaManager` — V1__initial_schema.sql migration
-- [ ] `LogSegment` — append, read, seal, delete
-- [ ] `OffsetIndex` — mmap'd, append, filePositionFor
-- [ ] `MetadataSegment` — compacted variant of LogSegment
-- [ ] `LogSegmentStore` — lifecycle management (open/seal/delete)
-- [ ] `StorageFlusher` — async 200ms background flush
-- [ ] HikariCP pool setup
+- [ ] `PostgresStorageEngine` — binary COPY append, SELECT fetchRange, highWatermark (defense-in-depth: `AND tenant_id = ?`)
+- [ ] `SchemaManager` — V1__initial_schema.sql; version table; idempotent
+- [ ] `LogSegmentState` — enum: ACTIVE, SEALED, FLUSHED, EXPIRED, DELETED
+- [ ] `LogSegment` — append, read, seal (`FileChannel.force(true)`), markFlushed(), markForDeletion(); CRC32C per record
+- [ ] `OffsetIndex` — mmap'd (lazy: `ensureMapped()`), sparse (1 entry/4 KB), warm section (first 1024 entries in `long[]` heap cache), append, filePositionFor, truncateToActualSize on seal
+- [ ] `LogSegmentStore` — `ConcurrentHashMap<PartitionId, ConcurrentSkipListMap<Long, LogSegment>>`; `floorSegment()`, `openNewSegment()`, `sealedUnflushed()`
+- [ ] `MetadataSegment` — compacted variant of LogSegment (used by internal topics)
+- [ ] `StorageFlusher` — 200 ms cycle; `ThreadLocal<Connection>` (dedicated PG conn); `flush(seg)`: COPY → COMMIT → `markFlushed()` in that order; `drainAll(timeout)` for shutdown
+- [ ] `SegmentCleaner` — 60 s cycle; 5-state lifecycle; disk budget (85 % reject / 70 % resume); 30 s deletion delay; minimum-1-segment guarantee per partition
+- [ ] `DiskBudgetMonitor` — `usagePercent(dataDir)` via `FileStore.getUsableSpace()`
+- [ ] HikariCP pool setup (pool size = worker-threads + 1 flusher + 1 read)
 
 ### Tests
-- [ ] `PostgresStorageEngineIT` — Testcontainers PG: append 10K, fetchRange, highWatermark
-- [ ] `LogSegmentTest` — append, read, seal, OffsetIndex lookup
-- [ ] `SchemaManagerIT` — migration idempotency
+- [ ] `PostgresStorageEngineIT` — Testcontainers PG: append 10K, fetchRange, highWatermark; tenant isolation (wrong tenantId returns empty)
+- [ ] `LogSegmentTest` — append, read, OffsetIndex lookup, CRC mismatch detection, warm-section vs mmap path, multi-segment spanning
+- [ ] `StorageFlusherTest` — markFlushed called only after COMMIT; crash-between-commit-and-mark is idempotent (duplicate PK rejected)
+- [ ] `SegmentCleanerTest` — 30 s delay enforced; min-segment guarantee; disk-budget eviction
+- [ ] `SchemaManagerIT` — migration idempotency, re-run is no-op
 
 ---
 
@@ -36,15 +41,21 @@
 **Goal:** Fully functional single-broker with Kafka compatibility.
 
 ### ivy-broker (engine only, no clustering)
-- [ ] `WriteAccumulator` — per-partition batching (1K/1MB/5ms)
-- [ ] `WriteWorker` — 4 threads, PG-first transaction (UPDATE + COPY + COMMIT + ACK)
-- [ ] `ReadAccumulator` — L1 LogSegment + L3 PG fallback (no L2 yet)
-- [ ] `FlushEventDispatcher` — push notify subscribers after write
-- [ ] `SubscriptionRegistry` — register/unregister consumer handles
-- [ ] `DuplicateDetector` — producer_state idempotency check
-- [ ] `DefaultBrokerEngine` — single-broker mode (no HRW yet)
-- [ ] `ConsumerGroupCoordinator` — EMPTY→PREPARE_REBALANCE→COMPLETING→STABLE→DEAD
-- [ ] `TransactionCoordinator` — InitProducerId, AddPartitions, EndTxn
+- [ ] `WriteAccumulator` — per-partition swap-drain (lock-free `AtomicReference`); flush triggers 1K/1MB/5ms; `suspendTenant()` / `unsuspendTenant()`; `submitImmediate()` bypass for QoS-2 / publisher-confirm
+- [ ] `WriteWorker` — 4 **platform** threads (not virtual); `ThreadLocal<Connection>` for PG affinity; 2-layer epoch fence (local MetadataImage + PG `WHERE leader_epoch = ?`); binary COPY; `drainAll(timeout)` on shutdown
+- [ ] `ProducerStateManager` — sliding window (last 5 batches) per (producerId, partitionId); duplicate → return cached offset; gap → `OUT_OF_ORDER_SEQUENCE`; stale epoch → `INVALID_PRODUCER_EPOCH`
+- [ ] `FlushEventDispatcher` — 1 platform thread; `MpscArrayQueue<FlushEvent>` (JCTools, capacity 65536); 1 ms park when idle; 3 dispatch actions: `pendingFetchRegistry.notifyWaiters`, `subscriptionManager.broadcast`, `clusterNotifier.notifyPeers`; queue-full → drop event (safe)
+- [ ] `FlushEvent` — value record: `partitionId, baseOffset, endOffset, entryCount, timestampMs`
+- [ ] `PendingFetchRegistry` — `ConcurrentHashMap<PartitionId, CopyOnWriteArrayList<CompletableFuture<Boolean>>>`; `notifyWaiters(partitionId)` called by dispatcher; virtual thread parks on `future.join()`; timeout via scheduler `future.complete(false)`
+- [ ] `ReadAccumulator` — L1 LogSegment + L3 PG fallback (no L2 yet); multi-partition via `StructuredTaskScope` (5 s timeout, partial OK); HWM invariant checked before and after; read-through: L3 results populate L1 via `logSegmentStore.appendBatch()`
+- [ ] `IsolationFilter` — 4-gate chain: (1) tenant match, (2) control record skip, (3a) READ_UNCOMMITTED pass, (3b) READ_COMMITTED: LSO gate + aborted-transaction gate; applied per-record during segment scan
+- [ ] `TransactionLsoTracker` — `ConcurrentSkipListMap<PartitionId, ConcurrentSkipListMap<Long startOffset, Set<Long producerIds>>>`; `getLso()` = `firstKey()` O(1)
+- [ ] `AbortedTransactionTracker` — `CopyOnWriteArrayList<AbortedRange>` per partition; `isAborted(pid, producerId, offset)`; `getAbortedRanges(pid, from, to)` for KIP-98 client field
+- [ ] `CompactionFilter` — two-pass (build key→maxOffset map, then filter); tombstone retention via `deleteRetentionMs`; enabled when `partitionId ∈ compactedPartitions`
+- [ ] `SubscriptionRegistry` — register/unregister `ConsumerHandle`; `broadcast(partitionId, from, to)`
+- [ ] `DefaultBrokerEngine` — single-broker mode (no HRW yet); virtual-thread executor for `read()`; validates `SecurityContext` before every call
+- [ ] `ConsumerGroupCoordinator` — EMPTY→PREPARE_REBALANCE→COMPLETING_REBALANCE→STABLE→DEAD
+- [ ] `TransactionCoordinator` — InitProducerId, AddPartitions, EndTxn (commit advances LSO, abort records `AbortedRange`)
 - [ ] `DefaultAuthEngine` — SCRAM-SHA-256, PLAIN, AclStore
 
 ### ivy-codec (Kafka only)
@@ -66,9 +77,13 @@
 **kafka-clients version: `4.2.0` (stable release — not 4.3-SNAPSHOT)**
 - [ ] `KafkaProducerConsumerE2E` — produce 10K, consume, verify all offsets
 - [ ] `KafkaConsumerGroupE2E` — join group, rebalance, commit offsets
-- [ ] `KafkaTransactionE2E` — produce transactionally, commit + abort
+- [ ] `KafkaTransactionE2E` — produce transactionally, commit + abort; READ_COMMITTED hides in-progress records; aborted records not visible after EndTxn(ABORT)
 - [ ] `KafkaAdminE2E` — create topic, describe, delete
-- [ ] `WriteWorkerIT` — PG-first write, epoch validation, duplicate detection
+- [ ] `WriteWorkerIT` — PG-first write, 2-layer epoch fence, duplicate detection (sliding window), stale epoch rejection
+- [ ] `LongPollE2E` — fetch with maxWaitMs=2000; producer writes after 500ms; consumer returns in <1s
+- [ ] `IsolationFilterTest` — 4-gate chain unit test: tenant mismatch rejected, control records, LSO gate, aborted range gate
+- [ ] `CompactionFilterTest` — latest-per-key retained; tombstone within deleteRetentionMs kept; tombstone after deleteRetentionMs dropped
+- [ ] `ReadThroughCacheIT` — L3 miss populates L1; second read hits L1
 
 ---
 

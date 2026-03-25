@@ -78,6 +78,11 @@ Never pass `null` as a security context.
 In `WriteWorker.processBatch()`, the client ACK is sent only after the PG transaction
 has been committed. LogSegment write is always async (post-ACK).
 
+**R8a. `markFlushed()` fires after PG COMMIT, never before.**
+In `StorageFlusher.flush(segment)`, the segment is marked FLUSHED only after the COPY
+transaction has been committed. Calling `markFlushed()` before commit would allow the
+segment to be deleted while PG still lacks the data.
+
 **R9. LogSegment is a cache, not the source of truth.**
 Any code that needs to know the true high watermark or partition state must query PG.
 LogSegment reads are acceptable for performance; do not rely on LogSegment completeness.
@@ -89,6 +94,18 @@ This is a performance invariant: INSERT-based writes are forbidden in the write 
 **R11. Epoch fencing on every write.**
 Every PG UPDATE of `partition_offsets` must include `AND leader_epoch = :expectedEpoch`.
 If 0 rows are updated, the broker must throw `WrongEpochException` and not ACK.
+
+**R11a. WriteWorker threads are platform threads, not virtual threads.**
+Each `WriteWorker` holds a `ThreadLocal<Connection>` for a dedicated PG connection.
+Virtual threads do not have stable `ThreadLocal` affinity across park/unpark cycles.
+This rule prevents connection leaks and pool corruption from misplaced virtual-thread use
+in the write hot path. The read path uses virtual threads freely.
+
+**R11b. `AbortedRange` is registered before LSO advances.**
+`TransactionCoordinator.endTransaction(ABORT)` must call
+`abortedTxTracker.recordAbort(pid, range)` before calling `lsoTracker.onTxnEnd(pid, ...)`.
+Reversing the order would create a window where the LSO has advanced past the aborted range
+but the range is not yet in the tracker — consumers could read aborted records.
 
 ---
 

@@ -6,190 +6,189 @@
                     WRITE PATH
                         │
               ┌─────────▼──────────┐
-              │  PostgreSQL        │  ← Source of truth
-              │  (ACID, HA-ready)  │    ACK fires after COMMIT
+              │   PostgreSQL        │  ← Source of truth
+              │   (ACID, HA-ready)  │    ACK fires after COMMIT
               └─────────┬──────────┘
-                        │ async (200ms batching)
+                        │  async (StorageFlusher, ~200 ms)
               ┌─────────▼──────────┐
-              │  LogSegment        │  ← Read performance cache
-              │  (local NVMe)      │    Rebuilt from PG on restart
+              │   LogSegment        │  ← Read performance cache
+              │   (local NVMe)      │    Rebuilt from PG on restart
               └────────────────────┘
 
                     READ PATH
                         │
               ┌─────────▼──────────┐
-              │  L1: LogSegment    │  → <1ms (owner, warm)
+              │  L1: LogSegment     │  → <1 ms  (owner, warm)
               └─────────┬──────────┘
-                    (miss)
+                   (miss)
               ┌─────────▼──────────┐
-              │  L2: Owner cache   │  → ~1ms (inter-broker RPC)
-              │  (inter-broker)    │
+              │  L2: Owner cache    │  → ~1 ms  (inter-broker RPC)
               └─────────┬──────────┘
-                    (miss)
+                   (miss)
               ┌─────────▼──────────┐
-              │  L3: PostgreSQL    │  → ~3ms (SELECT)
+              │  L3: PostgreSQL     │  → ~2–5 ms (SELECT)
               └────────────────────┘
 ```
 
----
-
-## PostgresStorageEngine
-
-### Binary COPY Write Path
-
-Standard parameterized INSERT handles one row per round-trip (~0.1ms per message).
-Binary COPY streams an entire batch in one syscall — ~100x faster for bulk writes.
-
-```java
-// PgCopyOutputStream wraps a PG COPY FROM STDIN in binary format
-try (PGConnection pgConn = dataSource.getConnection().unwrap(PGConnection.class);
-     PgCopyOutputStream out = new PgCopyOutputStream(pgConn,
-         "COPY messages (partition_id, offset_num, tenant_id, key, value, " +
-         "headers, timestamp_ms, protocol_id, is_dlq) FROM STDIN WITH (FORMAT binary)")) {
-
-    out.writeHeader();  // PG binary format header
-    for (MessageRecord r : records) {
-        out.writeShort(9);                  // field count
-        out.writeUUID(r.partitionId());
-        out.writeLong(r.offset());
-        out.writeUUID(r.tenantId());
-        out.writeBytes(r.key());            // null-safe
-        out.writeBytes(r.value());
-        out.writeBytes(r.headers());
-        out.writeLong(r.timestampMs());
-        out.writeShort(r.protocolId());
-        out.writeBoolean(r.isDlq());
-    }
-    out.writeTrailer();
-}
-```
-
-The COPY is always executed within the same transaction as the `partition_offsets` UPDATE,
-ensuring atomicity between offset allocation and message persistence.
-
-### fetchRange Query
-
-```sql
-SELECT offset_num, key, value, headers, timestamp_ms, protocol_id
-FROM messages
-WHERE partition_id = :partitionId
-  AND tenant_id    = :tenantId       -- defense-in-depth
-  AND offset_num  >= :fromOffset
-  AND offset_num   < :toOffset
-ORDER BY offset_num
-LIMIT :maxRows;
-```
-
-**Why `tenant_id` in the WHERE clause when `partition_id` already implies it?**
-Defense-in-depth. A bug that passes the wrong `tenantId` would expose data across tenants
-without this clause. The extra index cost is negligible.
-
-### Schema Management
-
-```java
-class SchemaManager {
-    // Apply pending migrations on startup
-    void migrate() {
-        int currentVersion = readCurrentVersion();
-        for (Migration m : loadMigrations()) {
-            if (m.version() > currentVersion) {
-                executeSql(m.sql());
-                recordVersion(m.version());
-            }
-        }
-    }
-}
-```
-
-Migration files in `ivy-storage/src/main/resources/db/migration/`:
-```
-V1__initial_schema.sql       ← all tables, indexes
-V2__add_dlq_entries.sql      ← dlq_entries table
-V3__add_acl_entries.sql      ← acl_entries, credentials
-...
-```
+**Correctness invariant**: LogSegment may be absent or incomplete. A PG-committed record is
+always authoritative. If LogSegment and PG disagree, PG wins.
 
 ---
 
 ## LogSegment
 
-### File Layout
+### Directory Layout
 
-Each partition has a directory of segment pairs:
 ```
-data/
-  <tenantId>/<partitionId>/
-    00000000000000000000.log    ← messages
-    00000000000000000000.index  ← sparse offset index
-    00000000000000012345.log    ← next segment (sealed when prev exceeds threshold)
+{data-dir}/
+  {tenantId}/{partitionId}/
+    00000000000000000000.log      ← segment with baseOffset=0
+    00000000000000000000.index
+    00000000000000012345.log      ← sealed segment, baseOffset=12345
     00000000000000012345.index
-    ...
+    00000000000000098000.log      ← active segment (current writes land here)
+    00000000000000098000.index
 ```
 
-File names are the **base offset** of the first message in that segment (20-digit zero-padded).
+File names are the **base offset** of the first record in the segment, zero-padded to 20
+digits. This allows lexicographic sort = chronological sort, and enables O(log N) lookup
+of "which segment contains offset X?" via a `ConcurrentSkipListMap<Long baseOffset, LogSegment>`.
+
+### Multi-Segment Registry
+
+```java
+class LogSegmentStore {
+    // One per partition: sorted map of baseOffset → segment file pair
+    ConcurrentHashMap<PartitionId,
+        ConcurrentSkipListMap<Long, LogSegment>> segments;
+
+    // Find the segment that may contain `targetOffset`
+    // → largest baseOffset ≤ targetOffset
+    LogSegment floorSegment(PartitionId pid, long targetOffset) {
+        var map = segments.get(pid);
+        if (map == null) return null;
+        Map.Entry<Long, LogSegment> entry = map.floorEntry(targetOffset);
+        return entry == null ? null : entry.getValue();
+    }
+
+    // Open a new active segment (called when current exceeds size/time limit)
+    LogSegment openNewSegment(PartitionId pid, long baseOffset) { ... }
+}
+```
+
+Cross-segment reads (consumer spanning multiple segments) step through `floorEntry` +
+`higherEntry` until `maxBytes` is satisfied or the active segment is reached.
 
 ### .log File Format (per record)
 
 ```
-offset 0:  [size: 4 bytes]        total record size (excluding this field)
-offset 4:  [crc32: 4 bytes]       CRC of everything after this field
-offset 8:  [offset: 8 bytes]      absolute offset of this record
-offset 16: [timestamp_ms: 8 bytes]
-offset 24: [key_length: 4 bytes]  -1 if null
-offset 28: [key: key_length bytes]
-offset ?:  [value_length: 4 bytes]
-offset ?:  [value: value_length bytes]
-offset ?:  [headers_length: 4 bytes]
-offset ?:  [headers: headers_length bytes]
+offset  0: [size:          4 bytes]  total size of this record (excluding the size field itself)
+offset  4: [crc32c:        4 bytes]  CRC32C of all fields from offset 8 onward
+offset  8: [offset:        8 bytes]  absolute offset of this record
+offset 16: [timestamp_ms:  8 bytes]  wall-clock time in milliseconds
+offset 24: [flags:         1 byte]   bit 0 = isControl, bit 1 = isDlq, bit 2 = isTransactional
+offset 25: [producer_id:   8 bytes]  -1 if non-idempotent
+offset 33: [producer_epoch:2 bytes]  -1 if non-idempotent
+offset 35: [key_length:    4 bytes]  -1 if null
+offset 39: [key:           key_length bytes]
+offset  ?: [value_length:  4 bytes]
+offset  ?: [value:         value_length bytes]
+offset  ?: [headers_length:4 bytes]
+offset  ?: [headers:       headers_length bytes]
 ```
+
+CRC32C is computed over bytes 8 onward (not over the size or the CRC itself).
+On read, if `crc32c(bytes[8..end]) != stored_crc` → skip the record and log a warning
+(segment may be partially written after a crash; PG is authoritative).
 
 ### .index File Format (sparse)
 
 ```
-offset 0:  [relative_offset: 4 bytes]  offset - baseOffset (saves 4 bytes vs absolute)
-offset 4:  [file_position: 4 bytes]    byte offset in .log file
-
-... repeated every ~4KB of log data ...
+[relative_offset: 4 bytes]  = absoluteOffset - baseOffset
+[file_position:   4 bytes]  = byte offset within the .log file
+... one entry per ~4 KB of log data ...
 ```
 
-**Lookup:**
-1. Binary search `.index` for the largest `relative_offset` ≤ `(fetchOffset - baseOffset)`
-2. Seek to `file_position` in `.log`
-3. Scan forward until `offset >= fetchOffset`
+**Why sparse**: Dense indexing at 12 bytes/record × 1M records = 12 MB just for the index.
+Sparse at 4 KB intervals: a 512 MB segment produces at most ~128K index entries = ~1 MB.
+Maximum scan cost per lookup: 4 KB forward scan in the .log file (one or two disk pages).
 
-**Why sparse?**
-- Dense index = 12 bytes per message × 1M messages = 12MB (too large for mmap)
-- Sparse (1 entry per 4KB) = 12MB log → 1 entry = tiny mmap footprint
-- Worst case: scan 4KB of log after index hit (acceptable)
+**Pre-allocation**: The `.index` file is pre-allocated to its maximum size
+(`segment-max-bytes / index-interval-bytes * 8`) on segment creation to avoid fragmentation
+and eliminate `ftruncate` calls during writes. Sealed on close to actual size.
 
-### Segment Lifecycle
+### Warm Section Cache
 
-```
-OPEN (current)
-  ↓ (exceeds 512MB or 60 minutes)
-SEALED (immutable, read-only)
-  ↓ (exceeds retention period, default 7 days)
-DELETED
-```
+The first 1,024 index entries (~8 KB) of each `.index` file are copied into a `long[]` heap
+array on segment open. Binary searches over recent offsets hit this heap array instead of
+triggering OS page faults into the mmap region.
 
-`SegmentCleaner` runs every 60 seconds and deletes eligible segments.
-Before deleting, verifies the segment's data is persisted in PG (or not needed per retention policy).
+For the active segment (which grows continuously), the warm section covers the most recently
+appended records, which are the hottest for consumers at the tip of the partition.
 
-### LogSegment vs PG: Correctness Invariant
+### LazyIndex
 
-> A LogSegment record MAY be missing from disk (e.g. after crash).
-> A PG record that has been COMMITted is ALWAYS the truth.
-> On restart: rebuild LogSegment from PG for recent offsets (last 60 minutes).
+Sealed segments' `.index` files are **not** mmap'd at startup. The `MappedByteBuffer` is
+created on first access (`synchronized` lazy-init). This reduces startup time significantly
+when hundreds of segments exist for a long-running partition.
 
-**Rebuild on startup:**
 ```java
-// In ClusterManager.start():
-for each ownedPartition:
-    Offset pgHighWatermark = storageEngine.highWatermark(partitionId)
-    Offset segHighWatermark = logSegmentStore.highWatermark(partitionId)
-    if (segHighWatermark < pgHighWatermark):
-        records = storageEngine.fetchRange(partitionId, segHighWatermark, pgHighWatermark, MAX_BYTES)
-        logSegmentStore.append(partitionId, records)
+class OffsetIndex {
+    private volatile MappedByteBuffer indexBuffer;  // null until first use
+
+    long filePositionFor(long absoluteOffset) {
+        ensureMapped();   // double-checked locking
+        // ... binary search
+    }
+
+    private synchronized void ensureMapped() {
+        if (indexBuffer == null) {
+            FileChannel ch = FileChannel.open(indexPath, READ);
+            indexBuffer = ch.map(READ_ONLY, 0, ch.size());
+        }
+    }
+}
+```
+
+---
+
+## Segment Lifecycle (5 States)
+
+```
+ACTIVE
+  │  (size > 512 MB OR age > 60 min)
+  ↓
+SEALED  ──── FileChannel.force(true) called here (fsync)
+  │  (StorageFlusher copies to PG and commits)
+  ↓
+FLUSHED ──── segment.markFlushed() called ONLY AFTER PG COMMIT
+  │  (age > retention period, AND no active reader within 30 s)
+  ↓
+EXPIRED ──── SegmentCleaner marks markedForDeletion = true
+  │  (30-second deletion delay elapsed)
+  ↓
+DELETED ──── Files.delete(logPath); Files.delete(indexPath)
+```
+
+### Why FLUSHED Is Separate from SEALED
+
+A SEALED segment has been fsync'd to local disk but may not yet be persisted in PG.
+StorageFlusher runs asynchronously every 200 ms. If the broker crashes between SEALED
+and FLUSHED, the segment still exists on disk and will be flushed on restart.
+
+**Critical ordering in `StorageFlusher.flush(segment)`:**
+
+```
+1.  COPY segment records into PG messages table (binary COPY)
+2.  COMMIT the PG transaction
+3.  segment.markFlushed()        ← ONLY after confirmed COMMIT, never before
+
+If crash occurs between step 2 and 3:
+  - PG has the data (committed)
+  - segment.state = SEALED (not FLUSHED)
+  - On restart: StorageFlusher re-flushes the segment
+  - PG deduplication via PRIMARY KEY (partition_id, offset_num) rejects duplicates silently
+  → No data loss, no corruption
 ```
 
 ---
@@ -198,25 +197,46 @@ for each ownedPartition:
 
 ```java
 class OffsetIndex {
-    // mmap'd file — OS manages page cache
-    MappedByteBuffer indexBuffer;
+    final long     baseOffset;        // first offset in this segment
+    final Path     indexPath;
+    volatile MappedByteBuffer indexBuffer;  // lazily initialized
+    final long[]   warmSection;       // heap copy of first 1024 entries
+    int            warmSectionSize;   // entries actually populated
+    int            entryCount;        // total entries so far
 
-    // Binary search for largest entry with relativeOffset <= target
+    // O(log N) binary search
     long filePositionFor(long absoluteOffset) {
         long relativeOffset = absoluteOffset - baseOffset;
-        int lo = 0, hi = entryCount - 1;
-        while (lo < hi) {
-            int mid = (lo + hi + 1) / 2;
-            if (relativeOffsetAt(mid) <= relativeOffset) lo = mid;
-            else hi = mid - 1;
+
+        // Check warm section first (heap array, no page fault)
+        if (warmSectionSize > 0 && relativeOffset <= warmSection[(warmSectionSize-1)*2]) {
+            return binarySearchWarm(relativeOffset);
         }
-        return filePositionAt(lo);
+
+        ensureMapped();
+        return binarySearchMmap(relativeOffset);
     }
 
-    // Append entry (called by LogSegment.append() every ~4KB)
-    void append(long absoluteOffset, long filePosition) {
-        indexBuffer.putInt((int)(absoluteOffset - baseOffset));
-        indexBuffer.putInt((int)filePosition);
+    // Called during segment.append() — once per ~4 KB of log data
+    synchronized void append(long absoluteOffset, int filePosition) {
+        ensureMapped();
+        indexBuffer.putInt(entryCount * 8,     (int)(absoluteOffset - baseOffset));
+        indexBuffer.putInt(entryCount * 8 + 4, filePosition);
+        entryCount++;
+
+        if (entryCount <= 1024) {
+            warmSection[(entryCount-1)*2]   = absoluteOffset - baseOffset;
+            warmSection[(entryCount-1)*2+1] = filePosition;
+            warmSectionSize = entryCount;
+        }
+    }
+
+    // Called when segment is sealed
+    void truncateToActualSize() {
+        indexBuffer.force();
+        FileChannel ch = FileChannel.open(indexPath, WRITE);
+        ch.truncate((long) entryCount * 8);
+        ch.close();
     }
 }
 ```
@@ -225,36 +245,263 @@ class OffsetIndex {
 
 ## StorageFlusher
 
-Background service that drains the post-ACK LogSegment writes.
+Background service that copies committed records from WriteWorker queues into LogSegment
+files. Runs every 200 ms on a single dedicated thread.
+
+### Thread Model
 
 ```java
-class StorageFlusher {
-    // Per-partition queue of pending log writes
-    Map<PartitionId, Queue<List<MessageRecord>>> pendingFlushes;
+ScheduledExecutorService scheduler =
+    Executors.newSingleThreadScheduledExecutor(
+        Thread.ofPlatform().name("storage-flusher").factory());
 
-    // Called by WriteWorker after PG COMMIT
-    void schedule(PartitionId partition, List<MessageRecord> records) {
-        pendingFlushes.get(partition).add(records);
+scheduler.scheduleAtFixedRate(this::flushAll, 0, flushIntervalMs, MILLISECONDS);
+```
+
+A platform thread (not virtual) because this thread runs a tight loop and owns a
+`ThreadLocal<Connection>` for the PG COPY operations inside `flushAll()`.
+
+### ThreadLocal PG Connection
+
+StorageFlusher performs its own PG COPY operations (separate from WriteWorker).
+It uses a dedicated `ThreadLocal<Connection>` — one persistent PG connection for all
+COPY-from-segment operations:
+
+```java
+ThreadLocal<Connection> pgConn = ThreadLocal.withInitial(dataSource::getConnection);
+```
+
+This avoids pool contention with the 4 WriteWorker threads and gives the flusher its own
+query pipeline. If the connection drops, it is re-acquired on the next flush cycle.
+
+### Flush Logic
+
+```java
+void flushAll() {
+    for (PartitionId pid : logSegmentStore.allPartitions()) {
+        for (LogSegment seg : logSegmentStore.sealedUnflushed(pid)) {
+            try {
+                flush(seg);
+            } catch (Exception e) {
+                log.warn("Flush failed for {}, will retry next cycle", seg.path(), e);
+                // segment stays SEALED, retried on next 200 ms cycle
+            }
+        }
     }
+}
 
-    // Background thread: runs every 200ms
-    void flushAll() {
-        for (var entry : pendingFlushes.entrySet()) {
-            PartitionId partitionId = entry.getKey();
-            Queue<List<MessageRecord>> queue = entry.getValue();
-            List<MessageRecord> batch = drain(queue);
-            if (!batch.isEmpty()) {
-                logSegmentStore.append(partitionId, batch);
+void flush(LogSegment seg) throws Exception {
+    List<MessageRecord> records = seg.readAll();          // read from .log file
+    Connection conn = pgConn.get();
+    // 1. COPY records to PG messages table (binary format)
+    pgCopyInsert(conn, records);
+    // 2. COMMIT
+    conn.commit();
+    // 3. ONLY NOW mark flushed — after confirmed commit
+    seg.markFlushed();
+}
+```
+
+### drainAll() on Shutdown
+
+Called during graceful shutdown before WriteWorker threads are stopped:
+
+```java
+void drainAll(Duration timeout) {
+    acceptingSchedules = false;              // stop accepting new schedules
+    Instant deadline = Instant.now().plus(timeout);
+    while (Instant.now().isBefore(deadline)) {
+        flushAll();
+        if (logSegmentStore.sealedUnflushedCount() == 0) return;
+        Thread.sleep(50);
+    }
+    log.warn("{} segments still unflushed at shutdown", logSegmentStore.sealedUnflushedCount());
+}
+```
+
+Unflushed records at shutdown are safe: they are in PG (WriteWorker committed before ACK).
+The local LogSegment file will be re-flushed on next startup from PG.
+
+---
+
+## SegmentCleaner
+
+Runs every 60 seconds on a background thread. Manages the FLUSHED → EXPIRED → DELETED
+lifecycle and enforces disk budget.
+
+### Disk Budget Enforcement
+
+```
+DiskBudgetMonitor.usagePercent(dataDir):
+  > 85%  → aggressive mode: delete oldest FLUSHED segments even within retention window
+  70–85% → normal mode: delete only FLUSHED segments past retention period
+  < 70%  → safe mode: no deletions (disk pressure relieved)
+```
+
+**Minimum segment guarantee**: at least 1 SEALED or FLUSHED segment per partition is always
+kept, even under disk pressure. This ensures the LogSegment store is never completely empty
+(a completely empty L1 forces every read through L3/PG until StorageFlusher rebuilds it).
+
+### Deletion with 30-Second Delay
+
+A FLUSHED, EXPIRED segment is not deleted immediately:
+
+```java
+// Phase 1: mark for deletion
+void cleanExpired(LogSegment seg) {
+    if (seg.state() == FLUSHED && seg.isOlderThan(retentionMs)) {
+        seg.markForDeletion(clock.instant());  // state → EXPIRED
+    }
+}
+
+// Phase 2: actual deletion (next cleaner cycle, if 30 s have elapsed)
+void deleteMarked(LogSegment seg) {
+    if (seg.state() == EXPIRED &&
+        Duration.between(seg.markedForDeletionAt(), clock.instant()).toSeconds() >= 30) {
+        Files.deleteIfExists(seg.logPath());
+        Files.deleteIfExists(seg.indexPath());
+        logSegmentStore.remove(seg.partitionId(), seg.baseOffset());
+        seg.setState(DELETED);
+    }
+}
+```
+
+**Why 30 seconds?** A `ReadAccumulator` thread may have called `floorSegment()`, obtained
+a reference to this segment, and be mid-read when the cleaner runs. The 30-second window
+ensures any in-flight read using the old segment finishes before the file is deleted.
+An open `FileChannel` (POSIX) keeps the inode alive past `Files.delete()`, but the explicit
+delay makes the timing deterministic and avoids relying on GC finalization of the channel.
+
+### Full Cleaner Cycle
+
+```
+1. Seal any ACTIVE segments past max-size or max-age
+2. Identify SEALED segments not yet FLUSHED → StorageFlusher handles these
+3. For each FLUSHED segment per partition (sorted oldest-first):
+   a. Skip if it is the only SEALED/FLUSHED segment for this partition (minimum guarantee)
+   b. Skip if disk usage < 70% AND segment is within retention window
+   c. Mark EXPIRED (start 30 s timer)
+4. Delete any EXPIRED segments whose 30 s timer has elapsed
+5. Log metrics: active/sealed/flushed/expired counts per partition
+```
+
+---
+
+## PostgresStorageEngine
+
+### Binary COPY Write Path
+
+Standard parameterized INSERT = 1 PG round-trip per row. Binary COPY = entire batch in one
+syscall. The difference is ~100× for 1,000-message batches.
+
+```java
+// Inside WriteWorker.processBatch()
+try (PGCopyOutputStream out = new PGCopyOutputStream(
+        connection.unwrap(PGConnection.class),
+        "COPY messages (partition_id, offset_num, tenant_id, key, value, " +
+        "headers, timestamp_ms, protocol_id, is_dlq) FROM STDIN WITH (FORMAT binary)")) {
+
+    out.writeHeader();  // 11-byte PG binary COPY header
+    for (int i = 0; i < records.size(); i++) {
+        MessageRecord r = records.get(i);
+        out.writeShort(9);                   // field count
+        out.writeUUID(r.partitionId());
+        out.writeLong(baseOffset + i);       // offset_num
+        out.writeUUID(r.tenantId());
+        out.writeBytes(r.key());             // null writes -1 as length
+        out.writeBytes(r.value());
+        out.writeBytes(r.headers());
+        out.writeLong(r.timestampMs());
+        out.writeShort(r.protocolId().id());
+        out.writeBoolean(r.isDlq());
+    }
+    out.writeTrailer();                      // 2-byte 0xFFFF terminator
+}
+```
+
+The COPY command is always within the same transaction as the `UPDATE partition_offsets`,
+guaranteeing atomicity between offset allocation and record persistence.
+
+### fetchRange Query
+
+```sql
+SELECT offset_num, key, value, headers, timestamp_ms, protocol_id, is_dlq,
+       producer_id, producer_epoch, flags
+FROM   messages
+WHERE  partition_id  = :partitionId
+  AND  tenant_id     = :tenantId        -- defense-in-depth (never rely on partition_id alone)
+  AND  offset_num   >= :fromOffset
+  AND  offset_num    < :toOffset
+ORDER  BY offset_num
+LIMIT  :maxRows;
+```
+
+**Why `AND tenant_id = :tenantId`?**
+A bug that passes the wrong `TenantId` would expose records across tenants without this
+clause. The extra filter cost on an already-selective (`partition_id, offset_num`) index
+scan is negligible — it's an additional column check on already-retrieved rows.
+
+### highWatermark Query
+
+```sql
+SELECT next_offset FROM partition_offsets WHERE partition_id = :partitionId;
+```
+
+Called during startup rebuild and by non-owner brokers to validate their cached HWM.
+
+### Schema Management
+
+```java
+class SchemaManager {
+    void migrate(DataSource dataSource) {
+        int current = readCurrentVersion(dataSource);
+        for (Migration m : loadMigrationsFromClasspath("db/migration/")) {
+            if (m.version() > current) {
+                executeScript(dataSource, m.sql());
+                recordVersion(dataSource, m.version());
+                log.info("Applied migration V{}", m.version());
             }
         }
     }
 }
 ```
 
-**Why 200ms delay?**
-- LogSegment is a cache — small staleness is acceptable
-- Batching reduces fsync overhead (one fsync per 200ms vs per batch)
-- Readers that need very recent data fall back to PG (L3) until LogSegment catches up
+Migration files in `ivy-storage/src/main/resources/db/migration/`:
+```
+V1__initial_schema.sql        ← messages, partitions, partition_offsets, topics, tenants, ...
+V2__add_dlq_entries.sql       ← dlq_entries table
+V3__add_acl_entries.sql       ← acl_entries, credentials
+V4__add_delegation_tokens.sql ← delegation_tokens table
+...
+```
+
+Migrations are idempotent within a version (guarded by the `schema_version` table).
+
+---
+
+## Startup Rebuild
+
+On broker startup, for each partition this broker owns, the LogSegment cache is rebuilt
+from PG for the most recent records (those that might be missing from disk after a crash):
+
+```java
+// In ClusterManager.claimPartitions():
+for (PartitionId pid : ownedPartitions) {
+    long pgHwm  = storageEngine.highWatermark(pid);
+    long segHwm = logSegmentStore.highWatermark(pid);
+
+    if (segHwm < pgHwm) {
+        // LogSegment is behind PG — fill the gap
+        List<MessageRecord> missing =
+            storageEngine.fetchRange(pid, segHwm, pgHwm, MAX_REBUILD_BYTES);
+        logSegmentStore.appendBatch(pid, missing);
+        log.info("Rebuilt {} records for {} (seg={}, pg={})", missing.size(), pid, segHwm, pgHwm);
+    }
+}
+```
+
+`MAX_REBUILD_BYTES` defaults to 64 MB per partition. If the gap is larger (extended outage),
+it is filled lazily via read-through caching as consumers catch up.
 
 ---
 
@@ -267,15 +514,24 @@ storage:
     username: ivy
     password: ${IVY_PG_PASSWORD}
     pool:
-      maximum-pool-size: 20
-      minimum-idle: 5
+      maximum-pool-size: 6          # 4 WriteWorkers + 1 StorageFlusher + 1 read pool
+      minimum-idle: 4
       connection-timeout-ms: 3000
+      keepalive-time-ms: 30000
+
   log-segments:
     data-dir: /var/lib/ivy/data
-    segment-max-bytes: 536870912    # 512MB
-    segment-max-ms: 3600000         # 60 minutes
-    retention-ms: 604800000         # 7 days
-    index-interval-bytes: 4096      # 1 index entry per 4KB
-    flush-interval-ms: 200          # StorageFlusher interval
-    rebuild-on-startup: true        # rebuild LogSegment cache from PG on startup
+    segment-max-bytes: 536870912    # 512 MB — seal when exceeded
+    segment-max-ms: 3600000         # 60 minutes — seal when exceeded
+    retention-ms: 604800000         # 7 days — mark EXPIRED after this age
+    delete-retention-ms: 86400000   # 1 day — keep tombstones for compacted topics
+    index-interval-bytes: 4096      # one .index entry per 4 KB of .log data
+    flush-interval-ms: 200          # StorageFlusher cycle
+    rebuild-on-startup: true        # fill LogSegment gap from PG on broker start
+
+  disk-budget:
+    reject-threshold-percent: 85    # aggressive eviction above this
+    resume-threshold-percent: 70    # stop eviction below this
+    cleaner-interval-ms: 60000      # SegmentCleaner cycle
+    deletion-delay-ms: 30000        # wait after EXPIRED before DELETED
 ```
