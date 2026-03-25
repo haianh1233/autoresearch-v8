@@ -1,5 +1,98 @@
 # Re-Authentication Design
 
+> **Related:** [MULTI_TENANT.md](MULTI_TENANT.md), [RULES.md](RULES.md) §R27–R30,
+> [SECURITY.md](SECURITY.md), [TRANSACTIONS.md](TRANSACTIONS.md), [CLUSTERING.md](CLUSTERING.md)
+
+---
+
+## Problem Statement
+
+A persistent messaging connection has two distinct lifecycles that diverge over time:
+
+```
+Connection lifetime:  ─────────────────────────────────────────────────────────► (hours/days)
+Credential lifetime:  ──────────┤  ──────────┤  ──────────┤  (hours; expires/rotates)
+                              exp         exp         exp
+```
+
+Without re-auth, the only options are:
+1. **Never expire credentials** — unacceptable for security (compromised cred = permanent access)
+2. **Close + reconnect on expiry** — loses producer state, consumer group offsets, in-flight messages
+
+Re-auth solves this: the client refreshes credentials on the existing TCP connection without losing
+messaging session state. This is especially critical for:
+- **Long-lived producers** that use OAuth JWT tokens (typically 1-hour TTL)
+- **Consumer groups** that would lose partition assignments on reconnect
+- **Exactly-once producers** that would lose `producerId`/`producerEpoch` on reconnect
+- **Admin operations** holding locks or in-progress transactions
+
+**Requirements:**
+1. No disconnect required for credential refresh on protocols that support it (Kafka, MQTT 5.0, Pulsar)
+2. For protocols without in-band re-auth (AMQP, STOMP, NATS), graceful close must allow the client to reconnect cleanly
+3. Tenant MUST NOT change across re-auth — enforced at the state machine level
+4. ACL cache invalidated on every successful re-auth to pick up permission changes
+5. Idle connections NOT forcibly closed — only enforced on next request (KIP-368 semantics)
+6. Max 3 re-auth attempts per connection to prevent brute-force via re-auth
+
+---
+
+## Architecture: 3-Tier Design
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Tier 1: Per-Connection State Machine (ReAuthManager)                  │
+│  ─ AtomicReference<ReAuthState> with CAS transitions (lock-free)       │
+│  ─ Tenant immutability enforcement                                      │
+│  ─ MAX_REAUTH_ATTEMPTS = 3 per connection                               │
+│  ─ Stores in Netty channel attribute; one instance per live connection  │
+└──────────────────────────────────┬──────────────────────────────────────┘
+                                   │ calls
+┌──────────────────────────────────▼──────────────────────────────────────┐
+│  Tier 2: Protocol-Specific Handlers (ivy-codec)                        │
+│  ─ Category A: Kafka SaslHandshake+SaslAuthenticate (KIP-368)          │
+│  ─ Category A: MQTT 5.0 AUTH packet                                     │
+│  ─ Category A: Pulsar CommandAuthChallenge/CommandAuthResponse          │
+│  ─ Category A: RMQ Streams SASL re-send                                 │
+│  ─ Category B: MySQL COM_CHANGE_USER                                    │
+│  ─ Category B: Redis AUTH command                                       │
+│  ─ Category C: Graceful error frame + close (AMQP, NATS, STOMP, etc.)  │
+│  ─ Category D: Per-request (stateless, no session to re-auth)          │
+└──────────────────────────────────┬──────────────────────────────────────┘
+                                   │ scheduled by / triggers
+┌──────────────────────────────────▼──────────────────────────────────────┐
+│  Tier 3: Scheduling + Reactive Revocation (ivy-auth)                   │
+│  ─ ReAuthScheduler: proactive timer with jitter [0, 5000ms)            │
+│  ─ CredentialRevocationHandler: registry + reactive push               │
+│  ─ ReAuthMetrics: LongAdder counters, timer gauge                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Module Placement
+
+| Component | Module | Responsibility |
+|-----------|--------|---------------|
+| `ReAuthState` | `ivy-common` | Enum (5 states) |
+| `ReAuthConfig` | `ivy-common` | Config record |
+| `CredentialRevokedEvent` | `ivy-common` | Event value record |
+| `ReAuthManager` | `ivy-auth` | Per-connection state machine |
+| `ReAuthScheduler` | `ivy-auth` | Timer management |
+| `CredentialRevocationHandler` | `ivy-auth` | Registry + reactive revocation |
+| `ReAuthMetrics` | `ivy-auth` | Counters and gauges |
+| `KafkaSaslAuthenticateHandler` | `ivy-codec` (kafka) | KIP-368 mid-session re-auth |
+| `MqttReAuthHandler` | `ivy-codec` (mqtt) | AUTH packet handling |
+| `PulsarReAuthHandler` | `ivy-codec` (pulsar) | Challenge/response protocol |
+| `RmqStreamsReAuthHandler` | `ivy-codec` (rmq) | SASL re-auth |
+| `MysqlChangeUserHandler` | `ivy-codec` (mysql) | COM_CHANGE_USER |
+| `RedisAuthHandler` | `ivy-codec` (redis) | AUTH command |
+| `ProtocolReAuthHandler` | `ivy-codec` (shared) | Category C graceful close |
+
+**Key rule:** `ivy-broker` has ZERO re-auth awareness. All state machine transitions happen in
+`ivy-auth`/`ivy-codec` before any request reaches the broker engine.
+
+---
+
 Re-authentication (re-auth) allows a client on a persistent connection to refresh its
 credentials without disconnecting. This is required when:
 
@@ -542,3 +635,293 @@ SQL consumers authenticate once at connection time (MySQL handshake or PgWire st
 Re-auth for SQL consumers follows Category B (MySQL: `COM_CHANGE_USER`) or Category C
 (PgWire: reconnect). Both are handled via `CredentialRevocationHandler` for reactive
 push-based revocation.
+
+---
+
+## Category A: Pulsar CommandAuthChallenge
+
+Pulsar uses a broker-initiated challenge/response model. The broker sends a random challenge;
+the client responds with proof of knowledge.
+
+```
+S→C: CommandAuthChallenge(challenge_data=<32 random bytes>, protocol_version, sequence_id=N)
+C→S: CommandAuthResponse(response_data=<HMAC proof>, sequence_id=N)
+S→C: CommandAuthChallenge(challenge_data=b"", sequence_id=N)  ← empty = success
+
+On failure:
+S→C: CommandError(error=AuthenticationError, message="Re-authentication failed")
+     [connection closed]
+```
+
+The `sequence_id` prevents replay — a stale response with an old sequence ID is rejected.
+Clients advertise support via the `supportsAuthRefresh` capability flag in `CommandConnect`.
+
+---
+
+## Category A: RabbitMQ Streams SASL Re-Authentication
+
+RMQ Streams uses a proprietary SASL framing. The client re-sends `SaslAuthenticate` (API key
+`0x0013`) on an already-authenticated connection.
+
+```
+C→S: SaslAuthenticate(mechanism="SCRAM-SHA-256", sasl_data=<client-first-message>)
+S→C: SaslAuthenticate(sasl_data=<server-first-message>)
+C→S: SaslAuthenticate(sasl_data=<client-final-message>)
+S→C: SaslAuthenticate(sasl_data=b"")  ← empty sasl_data = success
+```
+
+**Invariants:**
+- Mechanism MUST match the mechanism used during initial auth (error code 20 on mismatch)
+- Username MUST match the original authenticated user (error code 21 on mismatch)
+- On success, the broker re-evaluates stream-level permissions and may send
+  `MetadataUpdate(STREAM_NOT_AVAILABLE)` for streams the re-authed user no longer has access to
+
+---
+
+## Category B: Redis AUTH Command
+
+Redis uses the `AUTH` command for re-authentication. Behaviour differs between RESP2 and RESP3:
+
+```
+RESP2 (Redis < 6):
+  C→S: *2\r\n$4\r\nAUTH\r\n$<len>\r\n<password>\r\n
+  S→C: +OK\r\n   or   -ERR invalid password\r\n
+
+RESP3 (Redis ≥ 6, supports username):
+  C→S: *3\r\n$4\r\nAUTH\r\n$<ulen>\r\n<username>\r\n$<plen>\r\n<password>\r\n
+  S→C: +OK\r\n   or   -WRONGPASS invalid username-password pair\r\n
+```
+
+**On success:** Session preserved; subscriptions and transactions remain active. Current principal
+updated to the new user.
+
+**On failure:** Connection NOT closed (unlike Kafka/MQTT). Client may retry. After `MAX_REAUTH_ATTEMPTS`
+(3) failures, the connection is closed.
+
+**RESP2 pub/sub note:** AUTH is blocked during an active SUBSCRIBE session in RESP2. The client
+must unsubscribe first, then AUTH, then re-subscribe. RESP3 clients may AUTH during pub/sub.
+
+---
+
+## Category C: Extended Protocol Coverage
+
+### NATS
+
+```
+S→C: -ERR 'User Authentication Expired'\r\n
+     [server closes TCP connection]
+```
+
+NATS has no graceful disconnect frame. The broker sends the error string and immediately closes
+the TCP connection. Well-behaved NATS clients reconnect automatically.
+
+### STOMP
+
+```
+S→C: ERROR\r\n
+     message:Authentication credentials expired\r\n
+     \r\n
+     \0
+     [server closes TCP connection]
+```
+
+The `message` header provides a human-readable reason. Per the STOMP spec, the server closes
+after sending the ERROR frame.
+
+### OpenWire (ActiveMQ Classic protocol)
+
+```
+S→C: ExceptionResponse(correlationId=0, exception=JMSSecurityException("credentials expired"))
+     [server closes TCP connection]
+```
+
+OpenWire `ExceptionResponse` with a `JMSSecurityException` signals the client that re-auth is
+required. JMS clients should catch this and reconnect via the ConnectionFactory.
+
+---
+
+## Category D: Extended Stateless Coverage
+
+### AWS Kinesis / SQS / SNS / EventBridge (SigV4)
+
+Every request is independently authenticated via AWS Signature Version 4. There is no session
+concept; credential expiry (IAM role token) is transparent to the broker — the next request with
+an expired SigV4 credential returns `403 Forbidden`. The client rotates credentials via the AWS
+SDK credential provider chain.
+
+```
+GET /streams/my-stream/records?ShardIterator=...
+Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/kinesis/aws4_request,
+               SignedHeaders=host;x-amz-date,
+               Signature=<computed>
+X-Amz-Date: 20240101T000000Z
+X-Amz-Security-Token: <session-token>   ← present for IAM role credentials
+
+On expired token: HTTP 403 {"__type":"InvalidSignatureException",...}
+```
+
+### Google Pub/Sub (gRPC + OAuth2)
+
+Every gRPC call carries an OAuth2 Bearer token in the `Authorization` metadata header. There is
+no session to re-auth; the gRPC channel is long-lived but each RPC is independently authorized.
+Token expiry returns `UNAUTHENTICATED` status; the client obtains a new token and retries.
+
+### S3-Compatible API (Pre-signed URLs)
+
+Pre-signed URLs embed credentials in the URL with an expiry (`X-Amz-Expires`). After expiry,
+the broker returns `403 AccessDenied`. There is no re-auth path; the client must generate a new
+pre-signed URL. This is handled entirely at the HTTP layer with no session state in the broker.
+
+---
+
+## Shutdown Integration
+
+On broker shutdown, all active re-auth timers must be cancelled before the connection draining
+phase to prevent spurious re-auth triggers during shutdown:
+
+```
+BrokerMain.shutdown():
+  1. Stop accepting new connections
+  2. reAuthScheduler.cancelAll()          ← cancel all pending timers
+  3. Drain existing connections (wait for in-flight requests)
+  4. Close all channels
+  5. Shut down event loop groups
+
+channelInactive() hook (per-connection cleanup):
+  reAuthScheduler.cancel(connectionId)              ← idempotent
+  credentialRevocationHandler.unregister(connId)    ← remove from registry
+```
+
+**Race condition on shutdown:** If a timer fires after `cancelAll()` but before the channel is
+closed, the `requireReAuth()` CAS will succeed but no response can be sent (channel closing).
+The terminal state machine handles this: `TIMED_OUT` → close channel, which is a no-op if
+the channel is already closing.
+
+---
+
+## Failure Modes
+
+| Failure | Cause | Broker Behaviour | Client Expectation |
+|---------|-------|------------------|--------------------|
+| **CAS race: timeout beats success** | Server timer fires while `IN_PROGRESS` success response is in flight | Timer transitions to `TIMED_OUT` first; `onReAuthSuccess()` CAS fails | Client gets `TIMED_OUT` close even though credential was valid; retry connects fresh |
+| **ReAuthScheduler at MAX_TIMERS** | 100,000+ concurrent connections | Timer not scheduled; re-auth triggered reactively on next request | Client's next request triggers re-auth challenge; slight extra latency |
+| **AuthEngine unavailable during re-auth** | PG connection down; credential store unreachable | `onReAuthFailure()` called; connection closed | Client reconnects; may succeed once PG recovers |
+| **SASL mechanism mismatch** | Client switches from SCRAM to OAUTHBEARER on re-auth | `RE_AUTH_FAILED` immediately; connection closed | Client should use same mechanism as initial auth |
+| **Tenant mismatch** | New credential resolves to different tenant | `RE_AUTH_FAILED`; `ILLEGAL_SASL_STATE` error to client | Client must use credential for the SNI-resolved tenant |
+| **Max attempts (3) exceeded** | Client sends 3 wrong credentials | `RE_AUTH_FAILED`; connection closed with auth error | Client must reconnect; exponential backoff recommended |
+| **Grace period elapsed** | Client does not respond to re-auth challenge within `gracePeriodMs` | `TIMED_OUT`; connection closed | Client must reconnect |
+| **Event loop thread blocked** | Re-auth CAS in progress when blocking I/O called | Netty pipeline stalls; watchdog timer eventually closes channel | Transparent to client (TCP timeout) |
+| **CredentialRevocationHandler registry leak** | `unregister()` not called on disconnect | Stale `connectionId`s accumulate; revocation triggers orphaned IDs | Harmless — `reAuthTrigger.accept()` for a closed channel is a no-op |
+
+---
+
+## Known Limitations
+
+| # | Limitation | Impact | Status |
+|---|-----------|--------|--------|
+| 1 | **`CONTINUE_READ_ONLY` failure action not implemented** — all failures close immediately | In-flight requests on failed connections are dropped | OPEN |
+| 2 | **Grace period not enforced at timer level** — `gracePeriodMs` config exists but no timer fires after `IN_PROGRESS` timeout | Client could delay re-auth indefinitely while in `IN_PROGRESS` | OPEN — needs a second timer: `gracePeriodMs` from `startReAuth()` |
+| 3 | **MQTT 5.0 multi-step SCRAM not wired** — only single-round mechanisms work for MQTT re-auth | SCRAM-SHA-256 AUTH packet exchange not handled | OPEN |
+| 4 | **ReAuthScheduler not wired in server bootstrap** — each protocol handler schedules its own timer | No centralized timer; MAX_TIMERS cap not enforced globally | OPEN |
+| 5 | **CredentialRevocationHandler not wired to admin API** — reactive push disabled | Credential revocation does not close active connections | OPEN — only timer-based re-auth works |
+| 6 | **Kafka session lifetime computation** — `sessionLifetimeMs` must be computed from `min(maxReauthMs, tokenExp - now - buffer)`; currently correct in design but ensure no hardcoding in implementation | Incorrect lifetime breaks re-auth scheduling | VERIFY in implementation |
+| 7 | **AMQP 0-9-1 `Connection.UpdateSecret` not implemented** | OAuth2 RabbitMQ clients cannot refresh in-band; must reconnect | WONTFIX — not part of AMQP 0-9-1 standard |
+| 8 | **AMQP 1.0 SASL renegotiation not implemented** | AMQP 1.0 clients must reconnect | WONTFIX — spec does not define mid-session SASL |
+| 9 | **ACL cache invalidation callback** — must be wired to actual `AclAuthorizer.invalidateByPrincipal()`, not a no-op lambda | New ACL rules not visible after re-auth until cache TTL expires | OPEN — wire real invalidator when AclAuthorizer is available |
+| 10 | **Redis handler must use `ReAuthManager`** — bare failure counter is inconsistent with architecture | Redis max-attempts not CAS-safe; tenant immutability not checked | OPEN — refactor to use `ReAuthManager` |
+| 11 | **No re-auth metrics export** — counters exist but not connected to metrics endpoint | No visibility into re-auth activity | OPEN |
+| 12 | **Delegation token re-auth** — delegation tokens can be used for Kafka KIP-368 re-auth but the renewal flow (create new token, use it for re-auth) is not explicitly tested | Token-based re-auth may have edge cases | OPEN |
+
+---
+
+## Key Design Decisions
+
+### D1: Per-Connection State Machine vs Centralized
+
+**Chosen:** Per-connection `ReAuthManager` with `AtomicReference<ReAuthState>`.
+
+**Rejected:** Centralized session store (e.g., `ConcurrentHashMap<ConnectionId, ReAuthState>`).
+
+**Rationale:** At 100K concurrent connections, a centralized store becomes a contention point.
+Per-connection state is naturally partitioned — no connection shares re-auth state with another.
+The only cross-connection operation is revocation lookup in `CredentialRevocationHandler`,
+which uses a read-heavy `CopyOnWriteArraySet` per principal (small sets, few writes).
+
+### D2: CAS-Based Transitions (No Locks)
+
+**Chosen:** `AtomicReference.compareAndSet()` for all state transitions.
+
+**Rejected:** `ReentrantLock` or `synchronized`.
+
+**Rationale:** Re-auth handlers run on Netty's event loop threads, which must never block.
+CAS is non-blocking and correct for single-connection transitions; only one thread at a time
+can win a transition (the loser gets an immediate failure response).
+
+### D3: Idle Connection Preservation (KIP-368 Semantics)
+
+**Chosen:** Only enforce session expiry when the client next sends a request.
+
+**Rejected:** Proactive forced close at session expiry.
+
+**Rationale:** Proactive close breaks Kafka producers that are legitimately idle (e.g., batching
+builds up). KIP-368 specifies that idle connections are NOT forcibly closed. The latency cost of
+re-auth on the first request after expiry is acceptable (~50ms for SCRAM).
+
+### D4: `TenantUsername` Composite Key in Revocation Registry
+
+**Chosen:** Registry key = `(TenantId, username)` composite.
+
+**Rejected:** `username` alone as key.
+
+**Rationale:** Same username (`alice`) can exist in multiple tenants. A bare username key would
+cause revocation of `acme/alice` to also close `beta/alice`'s connections — a cross-tenant
+isolation breach. The composite key prevents this.
+
+### D5: Jitter on Re-Auth Timers
+
+**Chosen:** `[0, 5000ms)` random jitter subtracted from the fire time.
+
+**Rejected:** No jitter; exact `sessionLifetimeMs - buffer` delay.
+
+**Rationale:** Without jitter, all connections authenticated within the same second (e.g., after
+a broker restart that re-onboards 10K clients) would fire re-auth at the exact same instant,
+creating a thundering herd against the credential store. 5s jitter spreads the load naturally.
+
+---
+
+## Test Strategy
+
+### Unit Tests
+
+| Class | Test Focus | Key Cases |
+|-------|-----------|-----------|
+| `ReAuthManagerTest` | State machine transitions | CAS transitions, tenant mismatch → FAILED, max attempts, terminal state immutability, concurrent CAS race (only 1 winner) |
+| `ReAuthSchedulerTest` | Timer scheduling | Jitter distribution, MAX_TIMERS capacity, cancel-on-disconnect, cert expiry scheduling, disabled config |
+| `CredentialRevocationHandlerTest` | Revocation registry | Tenant isolation (same username, different tenants), wildcard revocation, concurrent register/revoke, empty-set cleanup |
+| `KafkaReAuthHandlerTest` | KIP-368 wire format | Mechanism mismatch, tenant mismatch, SCRAM 4-message exchange, OAUTHBEARER single-round, `sessionLifetimeMs` computation |
+| `MqttReAuthHandlerTest` | AUTH packet | MQTT 5.0 only (3.1.1 rejected), authMethod immutability, reason codes |
+| `CategoryBCReAuthTest` | MySQL/Redis/graceful-close | COM_CHANGE_USER session reset, Redis pub/sub AUTH blocked in RESP2, NATS error string, STOMP ERROR frame |
+
+### Integration Tests
+
+| Test | Scenario |
+|------|---------|
+| `KafkaReAuthIT` | Real Kafka producer holds connection through 3 OAUTHBEARER renewals; verifies no message loss |
+| `KafkaScramReAuthIT` | SCRAM re-auth mid-batch produce; verifies `producerId` preserved |
+| `MqttReAuthIT` | MQTT 5.0 client re-auths via AUTH packet; subscription preserved |
+| `CredentialRevokeIT` | Admin revokes credential; all matching connections closed within 5s |
+| `TenantMismatchIT` | Re-auth with credential for wrong tenant → connection closed, error logged |
+| `MaxAttemptsIT` | 4 consecutive wrong credentials → `RE_AUTH_FAILED` after 3rd, connection closed |
+
+### E2E Tests
+
+| Test | Scenario |
+|------|---------|
+| `LongRunningProducerE2E` | Kafka producer runs for 3+ hours with hourly JWT rotation; zero dropped messages |
+| `CredentialRotationE2E` | SCRAM password rotated during active produce; grace period allows seamless transition |
+| `CategoryCReconnectE2E` | AMQP client reconnects after graceful close; consumer group rejoins cleanly |
+
+---
+
+*Last updated: 2026-03-25*
+*See also: [MULTI_TENANT.md](MULTI_TENANT.md) §TenantContext, [RULES.md](RULES.md) §R27–R28*

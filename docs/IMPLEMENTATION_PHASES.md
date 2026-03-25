@@ -250,6 +250,44 @@
 
 ---
 
+## Phase 4.5 — Shutdown & Crash Recovery
+
+**Goal:** Production-grade graceful shutdown and crash recovery across both standalone and cluster modes.
+See [SHUTDOWN_AND_RECOVERY.md](SHUTDOWN_AND_RECOVERY.md) for the full design.
+
+### ivy-broker (shutdown sequence)
+- [ ] `BrokerStatus` enum — `STARTING`, `RUNNING`, `DRAINING`, `STOPPING`, `STOPPED`
+- [ ] `GracefulShutdown` — 12-step sequence; CAS RUNNING→DRAINING; each step wrapped in `swallow()`
+- [ ] `GracefulShutdown.Step2` — stop accepting connections; per-protocol going-away signals (MQTT `0x8B`, AMQP `Connection.Close(320)`, HTTP `Connection: close`); drain 30s; force-close
+- [ ] `GracefulShutdown.Step2_5` — `DeliveryEngine.prepareForShutdown()`: nack(REQUEUE) all unacked push deliveries; cancel ack-deadline timers
+- [ ] `GracefulShutdown.Step3` — `TransactionCoordinator.prepareForShutdown(5s)`: abort ONGOING, preserve PREPARED
+- [ ] `GracefulShutdown.Step7` — `StorageFlusher.drainAll(30s)` (see STORAGE.md §drainAll)
+- [ ] `GracefulShutdown.Step9` — segment disposition: delete FLUSHED (engine mode), keep all (standalone)
+- [ ] `CleanShutdownMarker` — write/delete/exists; fsync file + directory
+
+### ivy-broker (crash recovery)
+- [ ] `RecoveryPath` enum — `NORMAL` (marker exists), `DIRTY` (marker missing + segments), `FULL` (no segments)
+- [ ] `BrokerRecoveryEngine` — 7-phase recovery; selects path; executes phases in order
+- [ ] `DirtyRecovery` — CRC32C validation per `LogEntry`; truncate to last valid entry on mismatch; delete orphaned `.deleted` files; rebuild `OffsetIndex` from `.log` scan if `.index` missing or corrupt
+- [ ] `TransactionRecovery` — replay control records; register `AbortedRange` **before** LSO advance (Rule R11b); zombie producer detection
+- [ ] `MetadataReplay` — replay 9 internal topics in fixed order
+- [ ] `SegmentPgReconciliation` — compare segment max-offset vs PG `partition_offsets.next_offset`; re-flush gap if segment ahead; advance allocator if PG ahead
+
+### Tests
+- [ ] `GracefulShutdownTest` — all 12 steps execute in order; CAS prevents double-shutdown; each step failure continues sequence; total time ≤ 130s
+- [ ] `CleanShutdownMarkerTest` — write/exists/delete; fsync verification
+- [ ] `RecoveryPathSelectionTest` — NORMAL when marker exists; DIRTY when missing + segments; FULL when no segments
+- [ ] `DirtyRecoveryTest` — CRC mismatch → truncate at correct offset; index rebuilt correctly
+- [ ] `TransactionRecoveryTest` — AbortedRange registered before LSO; orphaned transactions treated as aborted
+- [ ] `SegmentPgReconciliationTest` — gap re-flushed; PG-ahead sets allocator; in-sync no-op
+- [ ] `CrashRecoveryIT` — SIGKILL broker mid-produce; restart; verify all committed messages present, no duplicates (`shouldRecoverDataAfterSigkill`)
+- [ ] `GracefulRestartIT` — restart with clean marker; NORMAL recovery path; < 5s startup
+- [ ] `RollingRestartIT` — restart broker in 3-node cluster; partitions return to original owner; < 15s total unavailability
+- [ ] `ConsumerGroupCrashRecoveryIT` — kill coordinator; members rejoin; no committed-offset regression
+- [ ] `TransactionCrashIT` — kill broker mid-transaction; restart; ONGOING → aborted; producers retry; no duplicates
+
+---
+
 ## Phase 5 — Auth, Re-Auth, Observability, Polish
 
 **Goal:** Production-ready authentication, re-authentication, metrics, and operational tooling.

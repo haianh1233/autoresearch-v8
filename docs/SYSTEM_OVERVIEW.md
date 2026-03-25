@@ -188,6 +188,28 @@ Consumer nacks / TTL expires / max-retries exceeded
 
 ---
 
+## Design Documentation Index
+
+| Topic | Document |
+|-------|---------|
+| Write path (produce → PG) | [WRITE_PATH.md](WRITE_PATH.md) |
+| Read path (fetch, push) | [READ_PATH.md](READ_PATH.md) |
+| Storage (segments, flusher, cleaner) | [STORAGE.md](STORAGE.md) |
+| Clustering (HRW, heartbeat, fencing) | [CLUSTERING.md](CLUSTERING.md) |
+| Multi-tenancy (SNI, TenantId, ACLs) | [MULTI_TENANT.md](MULTI_TENANT.md) |
+| Transactions (exactly-once, 2PC) | [TRANSACTIONS.md](TRANSACTIONS.md) |
+| **Shutdown & crash recovery** | **[SHUTDOWN_AND_RECOVERY.md](SHUTDOWN_AND_RECOVERY.md)** |
+| Re-authentication | [RE_AUTH.md](RE_AUTH.md) |
+| PostgreSQL schema | [POSTGRES_SCHEMA.md](POSTGRES_SCHEMA.md) |
+| Protocol details | [PROTOCOLS.md](PROTOCOLS.md) |
+| Dead letter queues | [DEAD_LETTER_QUEUE.md](DEAD_LETTER_QUEUE.md) |
+| Internal load balancer | [INTERNAL_LOAD_BALANCER.md](INTERNAL_LOAD_BALANCER.md) |
+| Module structure | [MODULE_DESIGN.md](MODULE_DESIGN.md) |
+| Implementation rules | [RULES.md](RULES.md) |
+| Implementation phases | [IMPLEMENTATION_PHASES.md](IMPLEMENTATION_PHASES.md) |
+
+---
+
 ## Non-Goals
 
 - Raft / Paxos consensus (HRW + PG CAS is sufficient)
