@@ -217,6 +217,10 @@ Consumer nacks / TTL expires / max-retries exceeded
 | MQTT session persistence | [MQTT_SESSIONS.md](MQTT_SESSIONS.md) |
 | AMQP exchange & binding engine | [AMQP_EXCHANGES.md](AMQP_EXCHANGES.md) |
 | Idempotent producer (sliding window) | [IDEMPOTENT_PRODUCER.md](IDEMPOTENT_PRODUCER.md) |
+| JVM flags & tuning (Java 26, Shenandoah) | [JVM_TUNING.md](JVM_TUNING.md) |
+| Deterministic simulation (FoundationDB-style) | [DETERMINISTIC_SIMULATION.md](DETERMINISTIC_SIMULATION.md) |
+| Kafka pipelining race postmortem | [KAFKA_PIPELINING_POSTMORTEM.md](KAFKA_PIPELINING_POSTMORTEM.md) |
+| Kafka Streams compatibility quirks | [KAFKA_STREAMS_QUIRKS.md](KAFKA_STREAMS_QUIRKS.md) |
 | Module structure | [MODULE_DESIGN.md](MODULE_DESIGN.md) |
 | Implementation rules (R1–R36) | [RULES.md](RULES.md) |
 | Implementation phases | [IMPLEMENTATION_PHASES.md](IMPLEMENTATION_PHASES.md) |
