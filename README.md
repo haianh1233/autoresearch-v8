@@ -27,7 +27,9 @@ A focused, production-quality multi-protocol message broker.
 | [STORAGE.md](docs/STORAGE.md) | LogSegment format, OffsetIndex, StorageFlusher |
 | [IMPLEMENTATION_PHASES.md](docs/IMPLEMENTATION_PHASES.md) | 5-phase build plan with task checklists |
 | [MULTI_TENANT.md](docs/MULTI_TENANT.md) | SNI resolution, partition isolation, tenant lifecycle, per-tenant TLS/auth/quotas |
+| [TRANSACTIONS.md](docs/TRANSACTIONS.md) | Transaction design — Kafka KIP-98, AMQP Tx, AMQP 1.0 TransactionController, isolation levels, LSO, abort tracking |
 | [RE_AUTH.md](docs/RE_AUTH.md) | Re-authentication design — Kafka KIP-368, MQTT AUTH, MySQL COM_CHANGE_USER, reconnect-based, stateless HTTP |
+| [INTERNAL_LOAD_BALANCER.md](docs/INTERNAL_LOAD_BALANCER.md) | RouteTable, PartitionRouter (Murmur2), HRWRouter, write forwarding, read tiers, epoch fencing |
 | [RULES.md](docs/RULES.md) | Invariants enforced across the codebase (R1–R30) |
 
 ## Module Structure

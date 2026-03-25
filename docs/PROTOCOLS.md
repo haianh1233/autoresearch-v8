@@ -112,11 +112,17 @@ HTTP port (8081): dedicated ServerBootstrap with HttpServerCodec pre-installed
 - Coordinator election: broker with `hash(groupId) % N` from active brokers
 
 ### Transactions
-- `InitProducerId` → allocate `producerId` + `producerEpoch`, store in `producer_state`
-- `AddPartitionsToTxn` → register partitions in `transactions` table
-- `EndTxn(COMMIT)` → write control records to each partition, update `transactions` state
-- `EndTxn(ABORT)` → write abort control records, mark `transactions` as `COMPLETE_ABORT`
-- `TxnOffsetCommit` → commit offsets atomically within transaction
+- `InitProducerId` → allocate `producerId` + `producerEpoch`, store in `producer_state`; bump epoch on restart
+- `AddPartitionsToTxn` → register partitions in `transactions` table, transition `EMPTY → ONGOING`
+- `Produce(transactional=true)` → message written to PG (durable) but `lso` not advanced; invisible to `READ_COMMITTED` until `EndTxn(COMMIT)`
+- `TxnOffsetCommit` → commit offsets inside the transaction (pending until `EndTxn(COMMIT)`)
+- `EndTxn(COMMIT)` → `ONGOING → PREPARE_COMMIT` → write commit control records → `COMPLETE_COMMIT` → advance LSO
+- `EndTxn(ABORT)` → `ONGOING → PREPARE_ABORT` → write abort control records → `COMPLETE_ABORT` → register in `AbortedTransactionIndex`
+- Epoch fencing: `InitProducerId` on same `txnId` bumps epoch; stale epoch → `INVALID_PRODUCER_EPOCH`
+- Transaction timeout: `TransactionExpiryReaper` force-aborts after `timeoutMs` (default 60s)
+
+See [TRANSACTIONS.md](TRANSACTIONS.md) for full design: idempotent producers, isolation levels,
+LSO computation, `AbortedTransactionIndex`, AMQP transactions, and cross-protocol interaction.
 
 ### Auth
 - SASL/PLAIN (username:password, use with TLS)
@@ -179,7 +185,7 @@ See [RE_AUTH.md](RE_AUTH.md) for the full re-auth design including all protocols
 | Queue | Declare, DeclareOk, Bind, BindOk, Unbind, UnbindOk, Purge, Delete | Full lifecycle |
 | Basic | Publish, Deliver, Get, GetOk, GetEmpty, Ack, Nack, Reject, Consume, ConsumeOk, Cancel, CancelOk, Qos, QosOk | Full publish/consume |
 | Confirm | Select, SelectOk | Publisher confirms |
-| Tx | Select, SelectOk, Commit, CommitOk, Rollback, RollbackOk | AMQP transactions |
+| Tx | Select, SelectOk, Commit, CommitOk, Rollback, RollbackOk | AMQP channel-level transactions (see [TRANSACTIONS.md](TRANSACTIONS.md)) |
 
 ### Exchange Types
 

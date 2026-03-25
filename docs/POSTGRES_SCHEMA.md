@@ -141,25 +141,34 @@ CREATE TABLE messages (
   value         BYTEA     NOT NULL,
   headers       BYTEA,               -- packed: [key_len:2][key][val_len:4][val] repeated
   timestamp_ms  BIGINT    NOT NULL,
-  protocol_id   SMALLINT  NOT NULL,  -- 1=Kafka,2=AMQP,3=MQTT,4=MySQL,5=PgWire
+  protocol_id   SMALLINT  NOT NULL,  -- 1=Kafka,2=AMQP091,3=AMQP10,4=MQTT311,5=MQTT5,8=HTTP,0=control
   is_dlq        BOOLEAN   NOT NULL DEFAULT false,
+  is_control    BOOLEAN   NOT NULL DEFAULT false,  -- transaction control record (COMMIT/ABORT marker)
+  producer_id   BIGINT,                            -- NULL for non-idempotent writes
+  producer_epoch SMALLINT,                         -- NULL for non-idempotent writes
   PRIMARY KEY (partition_id, offset_num)
 ) PARTITION BY RANGE (offset_num);   -- optional: time-based or offset-based partitioning
 
 CREATE INDEX idx_messages_tenant ON messages(tenant_id, partition_id, offset_num);
 CREATE INDEX idx_messages_timestamp ON messages(partition_id, timestamp_ms);
+-- Fast abort scan: only control records matter for LSO and abort filtering
+CREATE INDEX idx_messages_control ON messages(partition_id, producer_id, offset_num)
+  WHERE is_control = true;
 ```
 
 **Write path:**
 ```sql
 -- In same transaction as partition_offsets UPDATE:
-COPY messages (partition_id, offset_num, tenant_id, key, value, headers, timestamp_ms, protocol_id)
+COPY messages (partition_id, offset_num, tenant_id, key, value, headers, timestamp_ms,
+               protocol_id, is_dlq, is_control, producer_id, producer_epoch)
 FROM STDIN WITH (FORMAT binary);
 ```
 
 **Notes:**
 - Binary COPY is ~3-5x faster than parameterized INSERT for bulk writes.
 - `is_dlq = true` means this message was routed via DlqRouter.
+- `is_control = true` marks transaction commit/abort boundary records (value = 1 byte: 1=COMMIT, 0=ABORT). Control records are never delivered to consumers; they are used only by `AbortedTransactionIndex` and `ReadAccumulator` for `READ_COMMITTED` isolation.
+- `producer_id` / `producer_epoch` are stored for idempotency deduplication and abort scanning. NULL for non-transactional protocols (AMQP, MQTT, HTTP).
 
 ---
 
