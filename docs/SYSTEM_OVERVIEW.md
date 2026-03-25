@@ -212,6 +212,11 @@ Consumer nacks / TTL expires / max-retries exceeded
 | Internal load balancer (SNI, transform, HRW) | [INTERNAL_LOAD_BALANCER.md](INTERNAL_LOAD_BALANCER.md) |
 | Consumer group coordination | [CONSUMER_GROUPS.md](CONSUMER_GROUPS.md) |
 | Observability & metrics (Prometheus) | [OBSERVABILITY.md](OBSERVABILITY.md) |
+| Testing strategy (E2E, chaos, benchmarks) | [TESTING_STRATEGY.md](TESTING_STRATEGY.md) |
+| Quota enforcement (token bucket) | [QUOTA_ENFORCEMENT.md](QUOTA_ENFORCEMENT.md) |
+| MQTT session persistence | [MQTT_SESSIONS.md](MQTT_SESSIONS.md) |
+| AMQP exchange & binding engine | [AMQP_EXCHANGES.md](AMQP_EXCHANGES.md) |
+| Idempotent producer (sliding window) | [IDEMPOTENT_PRODUCER.md](IDEMPOTENT_PRODUCER.md) |
 | Module structure | [MODULE_DESIGN.md](MODULE_DESIGN.md) |
 | Implementation rules (R1–R36) | [RULES.md](RULES.md) |
 | Implementation phases | [IMPLEMENTATION_PHASES.md](IMPLEMENTATION_PHASES.md) |
