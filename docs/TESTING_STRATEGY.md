@@ -1,6 +1,14 @@
 # Testing Strategy
 
 > **Related:** [IMPLEMENTATION_PHASES.md](IMPLEMENTATION_PHASES.md), [OBSERVABILITY.md](OBSERVABILITY.md)
+>
+> **Detailed Layer Docs:**
+> - [Layer 1: Unit Tests](testing/LAYER_1_UNIT_TESTS.md) — mocking strategy, key test classes, patterns
+> - [Layer 2: Integration Tests](testing/LAYER_2_INTEGRATION_TESTS.md) — PG-backed, TestBrokerLauncher
+> - [Layer 3: Sanity Tests](testing/LAYER_3_SANITY_TESTS.md) — 31 classes, 90 tests, ~60s
+> - [Layer 4: Full E2E Tests](testing/LAYER_4_E2E_TESTS.md) — Docker, multi-tenant, schema, ~200 tests
+> - [Layer 5: Chaos/Stress/Soak](testing/LAYER_5_CHAOS_STRESS_SOAK.md) — failure injection, 24h soak
+> - [Layer 6: Security/Cross-Protocol](testing/LAYER_6_SECURITY_CROSSPROTOCOL.md) — SASL, ACL, TLS, routing
 
 ---
 
