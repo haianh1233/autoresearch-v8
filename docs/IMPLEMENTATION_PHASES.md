@@ -146,9 +146,9 @@
 
 ---
 
-## Phase 3 — MySQL + PgWire SQL Protocols (Read-Only)
+## Phase 3 — MySQL + PgWire SQL Protocols (Read-Only) + HTTP REST
 
-**Goal:** SQL-based read-only view of broker state.
+**Goal:** SQL-based read-only view of broker state + HTTP produce/consume API.
 
 ### ivy-codec (MySQL + PgWire)
 - [ ] `MySqlHandshakeEncoder` / `MySqlPacketDecoder`
@@ -163,12 +163,44 @@
 - [ ] `PgWireQueryExecutor` — same as MySQL but PgWire encoding
 - [ ] `SqlQueryParser` — sealed SqlQuery hierarchy
 - [ ] Update `ProtocolDetector` for MySQL + PgWire
-- [ ] Update `NettyPipelineFactory` for all 5 protocols
+- [ ] Update `NettyPipelineFactory` for all 7 protocols (add MySQL, PgWire, HTTP)
+
+### ivy-protocol-http
+- [ ] `HttpProtocolBundle` — SPI registration, `codec()` returns null, `httpHandler()` returns dispatcher
+- [ ] `HttpRequestDispatcher` — Netty `ChannelInboundHandlerAdapter`, routes on HTTP method + path
+- [ ] `HttpRouteTable` — compile-time path → handler mapping
+- [ ] `HttpProduceHandler` — `POST /topics/{topic}/messages`
+  - JSON body → `PendingWrite` via `HttpMessageCodec`
+  - Explicit partition / key-hash / round-robin routing
+  - Response: `202 Accepted` with offset + partition
+- [ ] `HttpBatchProduceHandler` — `POST /topics/{topic}/messages/batch`
+  - Array of messages → `List<PendingWrite>`
+  - `207 Multi-Status` on partial failure
+- [ ] `HttpConsumeHandler` — `GET /topics/{topic}/messages`
+  - `offset`, `limit`, `partition`, `isolation` query params
+  - `waitMs` → long-poll via `FlushEventDispatcher`
+  - Response: JSON array with base64 key/value + headers + protocolId
+- [ ] `HttpTopicMetadataHandler` — `GET /topics`, `GET /topics/{topic}`, `GET /topics/{topic}/partitions`
+- [ ] `HttpAuthExtractor` — `Authorization: Bearer` / `X-API-Key` extraction
+- [ ] `HttpTenantResolver` — `X-Tenant-Id` header or JWT `tenant` claim
+- [ ] `HttpMessageCodec` — JSON ↔ `PendingWrite` / `FetchResult`, base64 encode/decode
+- [ ] Dedicated `ServerBootstrap` on port 8081 with `HttpServerCodec + HttpObjectAggregator`
+- [ ] Error mapping: `InternalErrorCode` → HTTP status codes
 
 ### Tests
 - [ ] `MySqlBrokerE2E` — SHOW TABLES, SELECT from topic, SELECT cluster state via JDBC
 - [ ] `PgWireBrokerE2E` — SELECT from topic, SELECT partitions, consumer_groups via psql
 - [ ] `SqlQueryParserTest` — all supported SQL patterns, unsupported → SqlQuery.Unsupported
+- [ ] `HttpProduceConsumeE2E` — produce via HTTP, consume via HTTP, verify offset + value
+- [ ] `HttpBatchProduceE2E` — batch produce, verify all offsets returned
+- [ ] `HttpLongPollE2E` — waitMs=5000; producer publishes after 1s; consumer returns in ~1s
+- [ ] `HttpAuthE2E` — valid Bearer token → 202; expired token → 401; missing → 401
+- [ ] `HttpCrossProtocolE2E` — produce via Kafka, consume via HTTP; produce via HTTP, consume via Kafka
+- [ ] `KafkaProduceHttpConsumeE2E` — Kafka producer (with re-auth) → HTTP consumer sees messages
+- [ ] `AmqpProduceSqlConsumeE2E` — AMQP 0-9-1 publish → MySQL SELECT sees messages (protocol_id=2)
+- [ ] `MqttProduceSqlConsumeE2E` — MQTT 5.0 publish → PgWire SELECT sees messages (protocol_id=5)
+- [ ] `HttpProduceAmqpConsumeE2E` — HTTP POST → AMQP Basic.Deliver
+- [ ] `HttpProduceMqttConsumeE2E` — HTTP POST → MQTT PUBLISH to subscriber
 
 ---
 
@@ -203,9 +235,9 @@
 
 ---
 
-## Phase 5 — Auth, Observability, Polish
+## Phase 5 — Auth, Re-Auth, Observability, Polish
 
-**Goal:** Production-ready authentication, metrics, and operational tooling.
+**Goal:** Production-ready authentication, re-authentication, metrics, and operational tooling.
 
 ### ivy-broker (auth complete)
 - [ ] `ScramAuthenticator` — SCRAM-SHA-256 full handshake
@@ -213,6 +245,25 @@
 - [ ] `AclAuthorizer` — deny by default, resource+operation matching
 - [ ] `TokenBucketQuotaManager` — per-principal produce/consume quota
 - [ ] V4__add_auth_tables.sql — credentials, acl_entries
+
+### ivy-broker (re-auth — all protocols)
+- [ ] `ReAuthManager` — per-connection CAS state machine (AUTHENTICATED → RE_AUTH_REQUIRED → IN_PROGRESS → AUTHENTICATED/FAILED)
+- [ ] `ReAuthScheduler` — session lifetime timer with jitter `[0, 5000ms)`, `reAuthBufferMs=30s`
+- [ ] `CredentialRevocationHandler` — reactive push on `__credentials` change; `ConnectionRegistry` lookup
+- [ ] `ConnectionRegistry` — `(TenantId, username) → Set<ConnectionId>` for revocation fan-out
+- [ ] `SessionLifetimeCalculator` — `min(maxReauthMs, tokenRemainingMs)` logic
+- [ ] V5__add_reauth_config.sql — per-tenant `max_reauth_ms` in tenants table
+
+**Protocol-specific re-auth:**
+- [ ] Kafka: extend `SaslHandshakeHandler` + `SaslAuthenticateHandler` to support re-auth on existing connection (KIP-368)
+  - `SaslAuthenticateResponse.sessionLifetimeMs` set from `SessionLifetimeCalculator`
+  - New `SaslHandshake` on existing authenticated connection → `ReAuthManager.beginReAuth()`
+  - In-flight `Produce` requests queued in `WriteAccumulator` during re-auth round-trips
+- [ ] MQTT 5.0: `Mqtt5AuthHandler` — broker-initiated `AUTH(0x19)` re-auth + `AUTH(0x18)` exchange
+- [ ] MySQL: `MySqlComChangeUserHandler` — `COM_CHANGE_USER` → `ReAuthManager` transition
+- [ ] AMQP 0-9-1: `Amqp091ReAuthHandler` — `Connection.Close(320, "re-authenticate")` on session expiry
+- [ ] AMQP 1.0: `Amqp10ReAuthHandler` — `close(error=unauthorized-access, description=session-expired)`
+- [ ] MQTT 3.1.1: `MqttReAuthHandler` — send `DISCONNECT` + close TCP on expiry (Category C)
 
 ### ivy-server (metrics + health)
 - [ ] Micrometer registry + Prometheus scrape endpoint (`/metrics`)
@@ -223,6 +274,8 @@
   - `ivy_broker_status` (ACTIVE=1, else 0)
   - `ivy_partition_ownership_count`
   - `ivy_consumer_group_lag` (by group, partition)
+  - `ivy_reauth_total{protocol, result}` — re-auth attempts by protocol + outcome
+  - `ivy_session_lifetime_ms` — histogram of actual session durations
 - [ ] Health check endpoint (`GET /health` → `{"status":"UP","broker":"ACTIVE"}`)
 - [ ] Readiness endpoint (`GET /ready` → 200 once PG schema migrated + cluster joined)
 - [ ] `ConnectionMetrics` — active connections per protocol
@@ -232,6 +285,13 @@
 - [ ] `AclE2E` — produce denied, consume denied, admin denied
 - [ ] `QuotaE2E` — produce throttled at configured rate
 - [ ] `MetricsE2E` — verify Prometheus metrics populated after produce/consume
+- [ ] `KafkaReAuthE2E` — produce with short `maxReauthMs`; verify re-auth fires; producer continues without disconnect
+- [ ] `KafkaReAuthProduceSqlConsumeE2E` — Kafka producer re-auths mid-stream; MySQL/PgWire SQL client reads all produced messages including those produced during re-auth window
+- [ ] `AmqpReAuthGracefulCloseE2E` — AMQP session expires; broker sends `Connection.Close(320)`; client reconnects and resumes
+- [ ] `MqttReAuthE2E` — MQTT 5.0 broker-initiated `AUTH(0x19)` re-auth; subscription resumes after success
+- [ ] `CredentialRevocationE2E` — revoke user credentials; all active connections for that user are closed within `revocationPollMs`
+- [ ] `TenantImmutabilityE2E` — re-auth attempt with different tenant credentials → `ILLEGAL_SASL_STATE` + disconnect
+- [ ] `ReAuthSchedulerTest` — session lifetime calculation: token TTL, maxReauthMs, expiry buffer, jitter bounds
 
 ---
 

@@ -173,3 +173,26 @@ Passwords, tokens, keys, and certificates must never appear in logs, exceptions,
 
 **R26. TLS is required for any port exposed outside localhost.**
 Non-TLS ports are for local development only. Production deployments must use TLS ports.
+
+---
+
+## Re-Authentication Rules
+
+**R27. Re-auth MUST NOT change the tenant.**
+If the new credentials resolve to a different `TenantId` than the connection's current
+`TenantId`, the broker MUST close the connection immediately with `ILLEGAL_SASL_STATE`.
+This is checked in `ReAuthManager` before accepting the `IN_PROGRESS → AUTHENTICATED` transition.
+
+**R28. ACL cache is invalidated on every successful re-auth.**
+`ReAuthManager.completeReAuth()` atomically clears all cached ACL decisions for the
+connection. The next authorization check will re-evaluate from `acl_entries`.
+
+**R29. Idle connections are NOT forcibly closed at session expiry (Kafka).**
+Per KIP-368: the session lifetime is checked lazily on the next incoming request.
+A sleeping producer is not disconnected mid-sleep. Only active connections that send
+a request after expiry receive a `RE_AUTHENTICATION_REQUIRED` error.
+
+**R30. HTTP auth is stateless — no session, no re-auth.**
+`HttpRequestHandler` evaluates credentials on every request. There is no `ReAuthManager`
+instance for HTTP connections. Token expiry returns `401 Unauthorized`; the client
+obtains a new token and retries the request.

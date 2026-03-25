@@ -2,10 +2,10 @@
 
 ## Vision
 
-A focused, production-quality multi-protocol message broker with seven protocol adapters
-(Kafka, AMQP 0-9-1, AMQP 1.0, MQTT 3.1.1, MQTT 5.0, MySQL-wire, PgWire), PostgreSQL as
-the single source of truth, HRW-based partition leadership for clustering, and first-class
-dead letter queues.
+A focused, production-quality multi-protocol message broker with eight protocol adapters
+(Kafka, AMQP 0-9-1, AMQP 1.0, MQTT 3.1.1, MQTT 5.0, MySQL-wire, PgWire, HTTP REST),
+PostgreSQL as the single source of truth, HRW-based partition leadership for clustering,
+and first-class dead letter queues.
 
 Everything is a log. Every protocol writes to the same partitions. Every consumer reads
 from the same offsets. PostgreSQL decides durability; the broker decides routing.
@@ -18,14 +18,14 @@ from the same offsets. PostgreSQL decides durability; the broker decides routing
 ┌──────────────────────────────────────────────────────────────────┐
 │                         ivy-server                               │
 │                                                                  │
-│  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌──────┐ ┌──────┐ │
-│  │ Kafka  │ │AMQP091 │ │AMQP 10 │ │MQTT311 │ │ MQTT5  │ │MySQL │ │ PG   │ │
-│  │Handler │ │Handler │ │Handler │ │Handler │ │Handler │ │Handlr│ │Handlr│ │
-│  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └──────┘ └──────┘ │
+│  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌──────┐ ┌──────┐ ┌──────┐ │
+│  │ Kafka  │ │AMQP091 │ │AMQP 10 │ │MQTT311 │ │ MQTT5  │ │MySQL │ │ PG   │ │HTTP  │ │
+│  │Handler │ │Handler │ │Handler │ │Handler │ │Handler │ │Handlr│ │Handlr│ │Handlr│ │
+│  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └──────┘ └──────┘ └──────┘ │
 │  NettyPipelineFactory │ ProtocolDetector │ BrokerMain            │
 ├──────────────────────────────────────────────────────────────────┤
 │                         ivy-codec                                │
-│   ivy-protocol-kafka  │  ivy-protocol-amqp   │  ivy-protocol-mqtt   │  ivy-protocol-pg/mysql  │
+│   ivy-protocol-kafka  │  ivy-protocol-amqp   │  ivy-protocol-mqtt   │  ivy-protocol-pg/mysql  │  ivy-protocol-http  │
 ├──────────────────────────────────────────────────────────────────┤
 │                         ivy-broker                               │
 │  BrokerEngine │ WriteWorker │ ReadAccumulator │ DlqRouter        │
@@ -61,6 +61,7 @@ ivy-server
   ├── ivy-protocol-mqtt       (MQTT 3.1.1 + 5.0)
   ├── ivy-protocol-postgresql
   ├── ivy-protocol-mysql
+  ├── ivy-protocol-http       (REST produce/consume, port 8081)
   ├── ivy-broker
   │     └── ivy-storage
   │           └── ivy-common
@@ -105,6 +106,21 @@ Client (JDBC/psql) → Handler → SQL parser → View resolver
   → SELECT from metadata → direct PG query (topics, partitions, consumer_groups, broker_registry)
   → SHOW TABLES          → list topics for tenant
   → Return ResultSet in MySQL/PgWire wire format
+
+Note: SQL clients see messages from ALL producing protocols (Kafka, AMQP, MQTT, HTTP).
+The protocol_id column identifies the producer: 1=Kafka, 2=AMQP 0-9-1, 3=AMQP 1.0,
+4=MQTT 3.1.1, 5=MQTT 5.0, 8=HTTP.
+```
+
+### HTTP Produce/Consume (REST API — port 8081)
+```
+Producer:  POST /topics/{topic}/messages         → BrokerEngine.write()
+Consumer:  GET  /topics/{topic}/messages?offset= → BrokerEngine.fetch()
+Long-poll: GET  /topics/{topic}/messages?waitMs= → BrokerEngine.fetch() + FlushEvent
+Metadata:  GET  /topics                          → BrokerEngine.listTopics()
+
+Auth: Bearer token (JWT) or X-API-Key header — per-request, stateless.
+No re-auth: tokens expire at JWT exp; client obtains a new token and retries.
 ```
 
 ### Dead Letter Queue
@@ -125,7 +141,7 @@ Consumer nacks / TTL expires / max-retries exceeded
 | Storage source of truth | PostgreSQL (PG-first) | ACID durability; ACK only after PG COMMIT |
 | LogSegment role | Async read cache | Performance optimization; not required for correctness |
 | Leadership election | HRW (Rendezvous Hash) | No Raft complexity; deterministic; O(1) lookup |
-| Protocol count | 7 (focused) | Kafka + AMQP 0-9-1 + AMQP 1.0 + MQTT 3.1.1 + MQTT 5.0 + MySQL + PgWire |
+| Protocol count | 8 (focused) | Kafka + AMQP 0-9-1 + AMQP 1.0 + MQTT 3.1.1 + MQTT 5.0 + MySQL + PgWire + HTTP |
 | Module count | 5 (clean) | Each module has a single clear responsibility |
 | DLQ | First-class, all messaging protocols | Missing in ivy-v9; essential for AMQP/MQTT semantics |
 | Multi-tenancy | Yes, SNI-based | Essential for SaaS; TenantId scopes all operations |
@@ -142,12 +158,13 @@ Consumer nacks / TTL expires / max-retries exceeded
 |----------|-------------|----------|
 | Kafka | 9092 | 9093 |
 | AMQP 0-9-1 | 5672 | 5671 |
-| AMQP 1.0 | 5673 | — (shared with 0-9-1 via negotiation, or separate) |
+| AMQP 1.0 | 5673 | 5674 |
 | MQTT 3.1.1 | 1883 | 8883 |
 | MQTT 5.0 | 1884 | 8884 (or shared 1883 via version negotiation) |
 | MySQL wire | 3306 | 3307 |
 | PgWire | 5432 | 5433 |
 | Inter-broker RPC | 9094 | — |
+| HTTP REST API (produce/consume) | 8081 | 8443 |
 | HTTP health/metrics | 8080 | — |
 
 ---
@@ -175,7 +192,7 @@ Consumer nacks / TTL expires / max-retries exceeded
 
 - Raft / Paxos consensus (HRW + PG CAS is sufficient)
 - ISR (In-Sync Replicas) — PG replication handles durability
-- More than 5 protocols in initial version
+- More than 8 protocols in initial version
 - Schema Registry (can be added later)
 - Multi-cluster federation (single PG cluster scope for now)
 - Built-in Kafka Connect / Streams compatibility beyond wire protocol

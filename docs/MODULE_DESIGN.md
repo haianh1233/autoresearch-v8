@@ -2,7 +2,7 @@
 
 ## Overview
 
-10 Maven modules. Codec and handler are **co-located per protocol** — no separate `ivy-codec` module.
+11 Maven modules. Codec and handler are **co-located per protocol** — no separate `ivy-codec` module.
 `ivy-server` is a thin assembly that auto-discovers protocols via `ProtocolBundleRegistry` (ServiceLoader).
 
 ```
@@ -12,6 +12,7 @@ ivy-server
   ├── ivy-protocol-mqtt       (3.1.1 + 5.0)
   ├── ivy-protocol-postgresql
   ├── ivy-protocol-mysql
+  ├── ivy-protocol-http       (REST produce/consume)
   ├── ivy-broker
   │     └── ivy-storage
   │           └── ivy-common
@@ -40,6 +41,7 @@ ivy-server
 | `ivy-protocol-mqtt` | MQTT 3.1.1 and 5.0 — codec + handlers (version-negotiated at CONNECT) |
 | `ivy-protocol-postgresql` | PgWire read-only SQL view — codec + handlers |
 | `ivy-protocol-mysql` | MySQL wire read-only SQL view — codec + handlers |
+| `ivy-protocol-http` | HTTP REST API — produce/consume via JSON over HTTP on port 8081 |
 | `ivy-server` | Thin assembly: Netty bootstrap + `ProtocolBundleRegistry` wiring + `BrokerMain` |
 | `ivy-testing` | Testcontainers fixtures, broker helpers, multi-protocol test utilities |
 
@@ -278,7 +280,7 @@ com.ivy.protocol.amqp10/                        ← AMQP 1.0
     Amqp10SessionState.java        — per-session: links, delivery-id tracking, link-credit map
     Amqp10ProtocolBundle.java      — implements ProtocolBundle
                                      detection: "AMQP" + bytes[4-7] = {0,1,0,0} or {3,1,0,0}
-                                     ports: 5673 (plain) or shared 5672 (negotiated post-magic)
+                                     ports: 5673 (plain), 5674 (TLS)
 ```
 
 ### ServiceLoader Registration

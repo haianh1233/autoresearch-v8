@@ -27,8 +27,9 @@ Protocol Wire Format → Protocol Handler → BrokerEngine (shared)
 | 3  | AMQP 1.0 | ISO standard, Azure Service Bus / ActiveMQ Artemis wire |
 | 4  | MQTT 3.1.1 | Pub/sub, IoT, most widely deployed MQTT version |
 | 5  | MQTT 5.0 | Enhanced MQTT: user properties, shared subscriptions, reason codes |
-| 6  | MySQL wire | Read-only SQL view |
-| 7  | PgWire | Read-only SQL view |
+| 6  | MySQL wire | Read-only SQL view of the message log |
+| 7  | PgWire | Read-only SQL view of the message log |
+| 8  | HTTP | REST produce/consume — stateless, per-request auth |
 
 Protocol IDs are stored in the `messages.protocol_id` column and segment trailers.
 They are **append-only** — never reuse or reorder an ID.
@@ -37,7 +38,8 @@ They are **append-only** — never reuse or reorder an ID.
 
 ## Protocol Detection (magic bytes)
 
-`ProtocolDetector` peeks at the first 4 bytes without consuming them:
+`ProtocolDetector` peeks at the first 4 bytes without consuming them.
+HTTP connections arrive on a dedicated port (8081) and do not need magic-byte detection.
 
 ```
 Bytes 0-3               → Protocol
@@ -61,6 +63,9 @@ Bytes 0-3               → Protocol
 ProtocolDetector peeks 8 bytes →
   match → remove self → install protocol-specific codec → fire channelRead
   no match → send error and close
+
+HTTP port (8081): dedicated ServerBootstrap with HttpServerCodec pre-installed
+  → no detection needed; pipeline is pre-wired for HTTP
 ```
 
 ---
@@ -116,6 +121,49 @@ ProtocolDetector peeks 8 bytes →
 ### Auth
 - SASL/PLAIN (username:password, use with TLS)
 - SASL/SCRAM-SHA-256
+
+### Re-Authentication (KIP-368)
+
+Kafka supports re-auth on an existing connection without disconnecting.
+This allows long-lived producer connections to rotate credentials without message loss.
+
+**Wire flow (on an already-authenticated connection):**
+```
+C→S: SaslHandshakeRequest(mechanism="SCRAM-SHA-256")   [API 17]
+S→C: SaslHandshakeResponse(errorCode=0, sessionLifetimeMs=3600000)
+     ← sessionLifetimeMs > 0 means broker enforces session expiry
+
+C→S: SaslAuthenticateRequest(<client-first-message>)   [API 36]
+S→C: SaslAuthenticateResponse(<server-first-message>)
+
+C→S: SaslAuthenticateRequest(<client-final-message>)
+S→C: SaslAuthenticateResponse(errorCode=0, saslAuthBytes=<server-final>,
+                               sessionLifetimeMs=3600000)  ← fresh session lifetime
+```
+
+**Triggers for re-auth:**
+1. `sessionLifetimeMs` from the previous `SaslAuthenticateResponse` elapses (server-enforced)
+2. `maxReauthMs` broker config fires (global maximum session lifetime)
+3. Credential revocation push (admin revokes the current credentials)
+
+**Rules:**
+- Re-auth MUST NOT change the tenant (mismatch → `ILLEGAL_SASL_STATE` + disconnect)
+- ACL cache is invalidated on every successful re-auth
+- Idle connections are NOT forcibly closed at expiry — session is checked on next request
+- In-flight requests that started before expiry complete normally
+
+**Producer behaviour during re-auth:**
+```
+1. Producer continues sending Produce requests normally
+2. At T-30s before expiry, ReAuthScheduler triggers re-auth initiation
+3. During SaslHandshake + SaslAuthenticate exchange, new Produce requests
+   are queued in WriteAccumulator (not rejected)
+4. On re-auth success, queued requests flush normally
+5. On re-auth failure (3 attempts exceeded), connection is closed;
+   producer receives a disconnect error and reconnects from scratch
+```
+
+See [RE_AUTH.md](RE_AUTH.md) for the full re-auth design including all protocols.
 
 ---
 
@@ -190,7 +238,7 @@ Basic.Publish → write to broker → on PG COMMIT → Basic.Ack(deliveryTag, mu
 
 ---
 
-## AMQP 1.0 Protocol (port 5673)
+## AMQP 1.0 Protocol (port 5673 / 5674 TLS)
 
 AMQP 1.0 is a fundamentally different wire protocol from 0-9-1 — not a version upgrade
 but a separate ISO/IEC 19464 standard. Used by Azure Service Bus, ActiveMQ Artemis,
@@ -646,22 +694,386 @@ PG ErrorResponse packet with fields:
 
 ## Cross-Protocol Message Consumption
 
-A message produced via Kafka can be consumed via AMQP or MQTT (and vice versa).
+All protocols write to the same `messages` table in PostgreSQL. Any protocol that can
+read from a partition will see all messages regardless of which protocol produced them.
+The `protocol_id` column records the producing protocol for observability.
 
 **Compatibility rules:**
 - `key` and `value` are raw bytes — all protocols pass through without modification
 - Headers:
   - Kafka headers → AMQP message headers (key-value map)
   - AMQP headers → Kafka headers
-  - MQTT: no headers in 3.1.1 → prepended as binary metadata prefix (if present)
+  - MQTT 5.0 user-properties → Ivy headers (round-trippable via Kafka/AMQP)
+  - MQTT 3.1.1: no headers → binary prefix if cross-protocol header data must be preserved
+  - HTTP: request headers prefixed `ivy-header-*` → Ivy headers
 - Timestamps: all stored as Unix milliseconds
 - Protocol-specific metadata (MQTT QoS, AMQP deliveryTag) is not persisted across protocols
 
-**Example: MQTT producer → Kafka consumer**
-```
-MQTT PUBLISH(topic="orders/new", payload="...", QoS=1)
-  → stored as messages row: (partitionId, offset, key=null, value=payload, protocol_id=3)
+---
 
-Kafka FETCH(topic="orders.new", partition=0, offset=42)
-  → returns Record(key=null, value=payload, headers=[], timestamp=...)
+### Kafka Produce → PostgreSQL/MySQL Consume
+
+Kafka producers write messages normally (with optional re-auth for long-lived connections).
+The messages land in the `messages` table. A SQL client then queries them directly.
+
 ```
+[Kafka producer] → SaslAuthenticate → Produce(topic="orders", partition=0)
+  → WriteAccumulator → WriteWorker → PG COMMIT
+  → messages row: (partition_id, offset, key, value, headers, timestamp_ms, protocol_id=1)
+
+[MySQL client, port 3306]
+  SELECT key, value, offset_num, timestamp_ms
+  FROM orders
+  WHERE offset_num > 0
+  LIMIT 100;
+
+[PgWire client, port 5432]
+  SELECT offset_num, key, value, headers, timestamp_ms
+  FROM orders
+  WHERE timestamp_ms > $1
+  ORDER BY offset_num
+  LIMIT $2;
+```
+
+The SQL clients do not participate in Kafka consumer groups. They have no offset tracking.
+Use them for ad-hoc inspection, debugging, or analytics — not as primary consumers.
+
+**Re-auth in this pattern:**
+- The Kafka producer uses KIP-368 re-auth to stay connected indefinitely
+- MySQL/PgWire clients authenticate once (MySQL handshake / PgWire startup) and reconnect
+  when credentials expire (Category C: reconnect-based)
+
+---
+
+### AMQP Produce → PostgreSQL/MySQL Consume
+
+AMQP clients publish to exchanges. The message is stored in the same `messages` table.
+
+```
+[AMQP 0-9-1 client, port 5672]
+  Connection.Open → Channel.Open → Exchange.Declare(name="events", type="direct")
+  → Basic.Publish(exchange="events", routing-key="order.created", body=<payload>)
+  → Basic.Ack (publisher confirm)
+  → messages row: (partition_id, offset, key="order.created", value=<payload>,
+                   headers={...AMQP headers...}, protocol_id=2)
+
+[AMQP 1.0 client, port 5673]
+  open → begin → attach(target="events", role=sender)
+  → transfer(payload=<body>, application-properties={...})
+  → disposition(accepted)
+  → messages row: (..., protocol_id=3)
+
+[MySQL client, port 3306]
+  SELECT key, value, offset_num, timestamp_ms, protocol_id
+  FROM events
+  WHERE protocol_id IN (2, 3)      -- filter AMQP-produced only, if desired
+  ORDER BY offset_num
+  LIMIT 50;
+```
+
+AMQP topic name mapping to SQL table name:
+- AMQP 0-9-1: `exchange.name` + `"."` + `queue.name` → Ivy topic → SQL table name
+- AMQP 1.0: `link.target.address` → Ivy topic → SQL table name
+
+---
+
+### MQTT Produce → PostgreSQL/MySQL Consume
+
+MQTT clients publish to topics. The message is stored in the same `messages` table.
+
+```
+[MQTT 3.1.1 client, port 1883]
+  CONNECT(clientId="sensor-01", cleanSession=true)
+  PUBLISH(topic="sensors/temperature", payload="22.5", QoS=1)
+  PUBACK received
+  → messages row: (partition_id, offset, key=null, value="22.5",
+                   headers={}, timestamp_ms=..., protocol_id=4)
+
+[MQTT 5.0 client, port 1884]
+  CONNECT(clientId="sensor-02", version=0x05)
+  PUBLISH(topic="sensors/humidity", payload="65", QoS=1,
+          user-properties=[("unit","percent"),("sensor-id","H-42")])
+  → messages row: (..., headers={unit=percent, sensor-id=H-42}, protocol_id=5)
+
+[PgWire client, port 5432]
+  -- MQTT topic "sensors/temperature" → Ivy topic "sensors.temperature"
+  SELECT offset_num, value, headers, timestamp_ms
+  FROM "sensors.temperature"
+  WHERE timestamp_ms > $1
+  ORDER BY offset_num;
+```
+
+**MQTT topic → SQL table name mapping:**
+MQTT topics use `/` as separator; Ivy normalises to `.` for the internal topic name.
+SQL queries must use the normalised name:
+```
+MQTT topic "home/living/temperature" → SQL table "home.living.temperature"
+MQTT topic "factory/line-1/rpm"     → SQL table "factory.line-1.rpm"
+```
+
+**Headers in MQTT 3.1.1 vs 5.0:**
+- MQTT 3.1.1: no user properties → `headers` column is empty `{}`; only the raw payload is available
+- MQTT 5.0: user properties → `headers` column contains the key-value pairs as a packed binary
+
+---
+
+### HTTP Produce/Consume → Kafka/AMQP/MQTT
+
+HTTP clients can produce to and consume from any topic, regardless of the topic's
+primary messaging protocol. The HTTP handler calls `BrokerEngine.write()` and
+`BrokerEngine.fetch()` — the same paths used by Kafka/AMQP/MQTT handlers.
+
+See the [HTTP Protocol section](#http-protocol-port-8081) below for full API details.
+
+---
+
+## HTTP Protocol (port 8081)
+
+The HTTP adapter exposes a simple REST API for producing and consuming messages.
+It does not require a persistent connection. Authentication is per-request.
+
+**Port assignment:** 8081 (separate from the admin/metrics port 8080).
+No magic-byte detection needed — the port is dedicated.
+
+### Authentication
+
+Every request must carry credentials. Two mechanisms are supported:
+
+```
+Authorization: Bearer <jwt-token>          ← OAuth 2.0 / OIDC token
+X-API-Key: <api-key>                       ← long-lived API key (stored in credentials table)
+```
+
+If credentials are missing or invalid: `401 Unauthorized`.
+If authorized but ACL denies the operation: `403 Forbidden`.
+
+There is no session. Tokens expire at their `exp` claim. The client obtains a new token
+and retries — no re-auth handshake needed (Category D stateless).
+
+Tenant is resolved from:
+1. The `X-Tenant-Id: <tenant-id>` header (explicit)
+2. The JWT `tenant` claim (from Bearer token)
+3. Error if neither is present
+
+### Produce
+
+**Single message:**
+```
+POST /topics/{topicName}/messages
+Content-Type: application/json
+Authorization: Bearer <token>
+X-Tenant-Id: <tenant-uuid>
+
+{
+  "key": "<base64-encoded-key>",          // optional
+  "value": "<base64-encoded-value>",      // required
+  "headers": {                            // optional; key-value string pairs
+    "order-id": "12345",
+    "content-type": "application/json"
+  },
+  "partition": 2                          // optional; omit for key-hash routing
+}
+```
+
+Response (`202 Accepted`):
+```json
+{
+  "topic":     "orders",
+  "partition": 2,
+  "offset":    10042,
+  "timestamp": 1700000000000
+}
+```
+
+**Batch produce:**
+```
+POST /topics/{topicName}/messages/batch
+Content-Type: application/json
+
+{
+  "messages": [
+    { "key": "...", "value": "...", "headers": {...} },
+    { "key": "...", "value": "...", "headers": {...} }
+  ]
+}
+```
+
+Response (`202 Accepted`):
+```json
+{
+  "results": [
+    { "partition": 0, "offset": 100, "timestamp": 1700000000000 },
+    { "partition": 0, "offset": 101, "timestamp": 1700000000001 }
+  ]
+}
+```
+
+On partial failure, `207 Multi-Status` is returned with per-message status codes.
+
+**Routing:**
+- `"partition"` field → explicit partition
+- `"key"` present, no explicit partition → Murmur2 hash routing (same as Kafka)
+- Neither → round-robin across partitions
+
+**Topic auto-creation:** if the topic does not exist and auto-create is enabled, the broker
+creates it with the default partition count before writing.
+
+### Consume (Pull)
+
+```
+GET /topics/{topicName}/messages?offset=<n>&limit=<m>&partition=<p>
+Authorization: Bearer <token>
+
+Query parameters:
+  offset      long   required  Start reading from this offset (inclusive)
+  limit       int    optional  Max messages to return (default: 100, max: 1000)
+  partition   int    optional  Specific partition (default: partition 0)
+  isolation   string optional  "read_committed" | "read_uncommitted" (default: read_committed)
+```
+
+Response (`200 OK`):
+```json
+{
+  "topic":     "orders",
+  "partition": 0,
+  "messages": [
+    {
+      "offset":    10042,
+      "timestamp": 1700000000000,
+      "key":       "<base64>",
+      "value":     "<base64>",
+      "headers":   { "order-id": "12345" },
+      "protocolId": 1
+    }
+  ],
+  "highWatermark": 10050
+}
+```
+
+The `protocolId` field shows which protocol produced each message:
+- `1` = Kafka, `2` = AMQP 0-9-1, `3` = AMQP 1.0, `4` = MQTT 3.1.1, `5` = MQTT 5.0, `8` = HTTP
+
+**Long-poll consume:**
+```
+GET /topics/{topicName}/messages?offset=<n>&limit=<m>&waitMs=5000
+```
+`waitMs` (default: 0) causes the broker to hold the response for up to `waitMs` ms waiting
+for new messages before returning an empty result. Implemented via `FlushEventDispatcher`
+subscription — same mechanism as Kafka Fetch long-poll.
+
+### Consume from AMQP/MQTT Topics via HTTP
+
+HTTP consume works identically regardless of which protocol produced the messages.
+The caller specifies the topic name using the Ivy canonical form:
+
+```
+# Messages produced by AMQP 0-9-1 to exchange "events", queue "orders"
+# → Ivy topic "events.orders"
+GET /topics/events.orders/messages?offset=0&limit=10
+
+# Messages produced by MQTT to "sensors/temperature"
+# → Ivy topic "sensors.temperature"
+GET /topics/sensors.temperature/messages?offset=0&limit=50
+
+# Messages produced by Kafka to "payments"
+# → Ivy topic "payments"
+GET /topics/payments/messages?offset=0&limit=20
+```
+
+### Produce to Kafka/AMQP/MQTT Topics via HTTP
+
+HTTP can produce to any existing topic. The message is stored and immediately consumable
+by any subscribed Kafka consumer, AMQP consumer, or MQTT subscriber:
+
+```
+POST /topics/payments/messages
+{ "key": "txn-001", "value": "{ \"amount\": 99.99 }", "headers": { "currency": "USD" } }
+
+→ messages row: (partition_id, offset, key="txn-001", value=..., protocol_id=8)
+
+→ Active Kafka consumer receives this message in next Fetch response
+→ Active AMQP subscriber receives it as Basic.Deliver
+→ Active MQTT subscriber receives it as PUBLISH
+```
+
+The HTTP produce path follows the same `WriteAccumulator → WriteWorker → PG COMMIT → ACK`
+path as all other protocols. The ACK is the `202 Accepted` HTTP response.
+
+### Topic and Partition Metadata
+
+```
+GET /topics
+→ lists all topics for the tenant
+
+GET /topics/{topicName}
+→ { "name": "orders", "partitionCount": 4, "retentionMs": 604800000 }
+
+GET /topics/{topicName}/partitions
+→ [{ "partition": 0, "leader": "broker-1", "highWatermark": 10050 }, ...]
+```
+
+### Error Responses
+
+| HTTP Status | Meaning |
+|-------------|---------|
+| 400 | Malformed request (missing value, bad base64, etc.) |
+| 401 | Missing or invalid credentials |
+| 403 | ACL denies produce/consume on this topic |
+| 404 | Topic not found (and auto-create disabled) |
+| 409 | Topic exists with different configuration |
+| 429 | Quota exceeded (produce/consume rate limit) |
+| 503 | No partition leader available (cluster not ready) |
+
+### HTTP → Ivy Mapping
+
+```
+POST /topics/{topic}/messages            → BrokerEngine.write(PendingWrite)
+GET  /topics/{topic}/messages?offset=N  → BrokerEngine.fetch(partitionId, N, limit)
+GET  /topics/{topic}/messages?waitMs=M  → BrokerEngine.fetch() with FlushEvent long-poll
+GET  /topics                             → BrokerEngine.listTopics(tenantId)
+GET  /topics/{topic}                     → BrokerEngine.describeTopic(tenantId, topicName)
+```
+
+### `ivy-protocol-http` Module
+
+```
+ivy-protocol-http/
+  src/main/java/com/ivy/protocol/http/
+    HttpProtocolBundle.java          ← ProtocolBundle SPI registration
+    HttpRequestDispatcher.java       ← Netty ChannelInboundHandlerAdapter
+    HttpRouteTable.java              ← path → handler mapping
+    handler/
+      HttpProduceHandler.java        ← POST /topics/{topic}/messages
+      HttpBatchProduceHandler.java   ← POST /topics/{topic}/messages/batch
+      HttpConsumeHandler.java        ← GET  /topics/{topic}/messages
+      HttpTopicMetadataHandler.java  ← GET  /topics, GET /topics/{topic}
+    auth/
+      HttpAuthExtractor.java         ← Bearer token / API key extraction
+      HttpTenantResolver.java        ← X-Tenant-Id header / JWT claim
+    codec/
+      HttpMessageCodec.java          ← JSON ↔ PendingWrite / FetchResult conversion
+      Base64Codec.java               ← key/value base64 encode/decode
+```
+
+HTTP does not use `ByteBufCodec` (that interface is for binary framing protocols).
+`HttpProtocolBundle.codec()` returns `null`; `HttpProtocolBundle.httpHandler()` returns
+the `HttpRequestDispatcher` to be wired into Netty's HTTP pipeline.
+
+### Port and Pipeline
+
+```yaml
+protocols:
+  http:
+    port: 8081           # REST API (produce/consume)
+    tls-port: 8443       # TLS REST API
+    max-request-bytes: 10485760   # 10 MB max request body
+    long-poll-max-ms: 30000       # cap on waitMs parameter
+```
+
+The HTTP port gets its own `ServerBootstrap` with:
+```
+HttpServerCodec → HttpObjectAggregator(10MB) → HttpRequestDispatcher
+```
+
+Health/metrics remain on port 8080 (`GET /health`, `GET /ready`, `GET /metrics`).
+
