@@ -29,12 +29,19 @@ A focused, production-quality multi-protocol message broker.
 ## Module Structure
 
 ```
-ivy-common/    — branded types, sealed interfaces (zero external deps)
-ivy-storage/   — LogSegment cache + PostgresStorageEngine
-ivy-broker/    — engine, write/read path, clustering, DLQ
-ivy-codec/     — all 5 protocol wire codecs
-ivy-server/    — Netty pipeline, handlers, BrokerMain
+ivy-common/               — branded types, ProtocolBundle SPI, sealed interfaces
+ivy-storage/              — LogSegment cache + PostgresStorageEngine
+ivy-broker/               — engine, write/read path, clustering, DLQ
+ivy-protocol-kafka/       — Kafka wire: codec + handlers co-located
+ivy-protocol-amqp/        — AMQP 0-9-1 (amqp/) + AMQP 1.0 (amqp10/) sub-packages
+ivy-protocol-mqtt/        — MQTT 3.1.1 + 5.0, version-negotiated at CONNECT
+ivy-protocol-postgresql/  — PgWire read-only SQL view
+ivy-protocol-mysql/       — MySQL wire read-only SQL view
+ivy-server/               — thin assembly: ProtocolBundleRegistry + Netty bootstrap
+ivy-testing/              — Testcontainers fixtures, multi-protocol helpers
 ```
+
+Each protocol module registers via `ServiceLoader` (`ProtocolBundle` SPI) — `ivy-server` has no handler logic.
 
 ## Quick Architecture
 

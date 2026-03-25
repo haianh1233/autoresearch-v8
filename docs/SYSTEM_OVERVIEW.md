@@ -25,7 +25,7 @@ from the same offsets. PostgreSQL decides durability; the broker decides routing
 │  NettyPipelineFactory │ ProtocolDetector │ BrokerMain            │
 ├──────────────────────────────────────────────────────────────────┤
 │                         ivy-codec                                │
-│  KafkaCodec │ Amqp091Codec │ Amqp10Codec │ Mqtt311Codec │ Mqtt5Codec │ MySqlCodec │ PgWireCodec  │
+│   ivy-protocol-kafka  │  ivy-protocol-amqp   │  ivy-protocol-mqtt   │  ivy-protocol-pg/mysql  │
 ├──────────────────────────────────────────────────────────────────┤
 │                         ivy-broker                               │
 │  BrokerEngine │ WriteWorker │ ReadAccumulator │ DlqRouter        │
@@ -56,11 +56,14 @@ from the same offsets. PostgreSQL decides durability; the broker decides routing
 
 ```
 ivy-server
-  └── ivy-codec
-  └── ivy-broker
-        └── ivy-storage
-              └── ivy-common
-        └── ivy-common
+  ├── ivy-protocol-kafka
+  ├── ivy-protocol-amqp       (AMQP 0-9-1 + 1.0)
+  ├── ivy-protocol-mqtt       (MQTT 3.1.1 + 5.0)
+  ├── ivy-protocol-postgresql
+  ├── ivy-protocol-mysql
+  ├── ivy-broker
+  │     └── ivy-storage
+  │           └── ivy-common
   └── ivy-common
 ```
 
@@ -68,8 +71,10 @@ Dependency rules (enforced at build time):
 - `ivy-common` has **zero** external runtime dependencies
 - `ivy-storage` depends only on `ivy-common` + JDBC/HikariCP
 - `ivy-broker` depends on `ivy-common` + `ivy-storage`
-- `ivy-codec` depends only on `ivy-common` + Netty buffer
-- `ivy-server` depends on all modules; it is the assembly point
+- Each `ivy-protocol-*` depends on `ivy-common` + `ivy-broker` + Netty only
+- No protocol module may depend on another protocol module
+- `ivy-server` depends on all modules; it is the only assembly point
+- Codec and handler are **co-located per protocol** — there is no separate `ivy-codec` module
 
 ---
 

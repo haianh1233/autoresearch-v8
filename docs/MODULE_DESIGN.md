@@ -2,591 +2,724 @@
 
 ## Overview
 
-5 Maven modules with strict dependency discipline. No circular dependencies.
-Assembly happens only in `ivy-server`. No module knows about `ivy-server` except itself.
+10 Maven modules. Codec and handler are **co-located per protocol** — no separate `ivy-codec` module.
+`ivy-server` is a thin assembly that auto-discovers protocols via `ProtocolBundleRegistry` (ServiceLoader).
 
 ```
 ivy-server
-  ├── ivy-codec        (protocol wire formats)
-  ├── ivy-broker       (engine, clustering, DLQ)
-  │     └── ivy-storage  (segments, PG)
+  ├── ivy-protocol-kafka
+  ├── ivy-protocol-amqp       (0-9-1 + 1.0)
+  ├── ivy-protocol-mqtt       (3.1.1 + 5.0)
+  ├── ivy-protocol-postgresql
+  ├── ivy-protocol-mysql
+  ├── ivy-broker
+  │     └── ivy-storage
   │           └── ivy-common
-  └── ivy-common       (foundation types)
+  └── ivy-common
+```
+
+**Dependency rules (enforced at build time):**
+- `ivy-common` — zero external runtime dependencies
+- `ivy-storage` — depends only on `ivy-common` + JDBC
+- `ivy-broker` — depends on `ivy-common` + `ivy-storage`
+- Each `ivy-protocol-*` — depends on `ivy-common` + `ivy-broker` + Netty
+- `ivy-server` — depends on all modules; the only module with `main()`
+- No protocol module may depend on another protocol module
+
+---
+
+## Module List
+
+| Module | Purpose |
+|--------|---------|
+| `ivy-common` | Branded types, sealed interfaces, `ProtocolBundle` SPI, `ByteBufCodec` SPI |
+| `ivy-storage` | `LogSegment` cache + `PostgresStorageEngine` (source of truth) |
+| `ivy-broker` | Engine, write/read paths, clustering, DLQ, consumer groups, transactions |
+| `ivy-protocol-kafka` | Kafka wire protocol — codec + all handlers |
+| `ivy-protocol-amqp` | AMQP 0-9-1 and AMQP 1.0 — codec + handlers (two sub-packages) |
+| `ivy-protocol-mqtt` | MQTT 3.1.1 and 5.0 — codec + handlers (version-negotiated at CONNECT) |
+| `ivy-protocol-postgresql` | PgWire read-only SQL view — codec + handlers |
+| `ivy-protocol-mysql` | MySQL wire read-only SQL view — codec + handlers |
+| `ivy-server` | Thin assembly: Netty bootstrap + `ProtocolBundleRegistry` wiring + `BrokerMain` |
+| `ivy-testing` | Testcontainers fixtures, broker helpers, multi-protocol test utilities |
+
+---
+
+## Core SPI (ivy-common)
+
+### ProtocolBundle
+
+Each protocol module registers one (or two) `ProtocolBundle` implementations via
+Java `ServiceLoader` (`META-INF/services/com.ivy.common.protocol.ProtocolBundle`).
+
+```java
+// ivy-common/src/main/java/com/ivy/common/protocol/ProtocolBundle.java
+public interface ProtocolBundle {
+    ProtocolId       protocolId();        // unique enum value
+    ByteBufCodec     codec();             // null for server-speaks-first protocols
+    DetectionRule    detectionRule();     // how to identify this protocol from first bytes
+    ProtocolPorts    defaultPorts();      // default plaintext + TLS ports
+    DestinationParser destinationParser(); // topic name resolution strategy
+    ChannelHandler   newFrameDecoder();   // Netty ByteToMessageDecoder factory
+    ChannelHandler   newRequestHandler(); // Netty ChannelInboundHandlerAdapter factory
+}
+```
+
+### ByteBufCodec
+
+```java
+// ivy-common/src/main/java/com/ivy/common/protocol/ByteBufCodec.java
+public interface ByteBufCodec {
+    ProtocolId    protocolId();
+    int           frameLength(ByteBuf in);                       // detect frame boundary
+    InternalRequest  decode(ByteBuf frame, CodecContext ctx);    // bytes → request
+    void          encode(InternalResponse resp, ByteBuf out, CodecContext ctx); // response → bytes
+    void          encodeError(InternalErrorCode code, ByteBuf out, CodecContext ctx);
+}
+```
+
+### ProtocolBundleRegistry
+
+```java
+// ivy-common/src/main/java/com/ivy/common/protocol/ProtocolBundleRegistry.java
+public class ProtocolBundleRegistry {
+    // Auto-discovers all ProtocolBundle implementations on the classpath
+    public static ProtocolBundleRegistry fromServiceLoader();
+
+    public void register(ProtocolBundle bundle);
+    public Optional<ProtocolBundle> lookup(ProtocolId protocolId);
+    public Collection<ProtocolBundle> listAll();
+}
+```
+
+### InternalRequest / InternalResponse (sealed)
+
+```java
+// Wire-format-agnostic representation used between codec and broker engine
+sealed interface InternalRequest {
+    record WriteRequest(TenantId, List<PendingWrite>, SecurityContext)   implements InternalRequest {}
+    record FetchRequest(TenantId, PartitionId, Offset, int maxBytes)     implements InternalRequest {}
+    record SubscribeRequest(TenantId, GroupId, List<PartitionId>)        implements InternalRequest {}
+    record CommitOffsetRequest(TenantId, GroupId, PartitionId, Offset)   implements InternalRequest {}
+    record CreateTopicRequest(TenantId, TopicName, int partitions)       implements InternalRequest {}
+    record MetadataRequest(TenantId, List<TopicName>)                    implements InternalRequest {}
+    record GroupCoordinatorRequest(TenantId, GroupId)                    implements InternalRequest {}
+    // ... others
+}
 ```
 
 ---
 
 ## ivy-common
 
-**Purpose:** Zero-dependency foundation. All domain types and core interfaces.
+**Purpose:** Zero-dependency foundation. Types, interfaces, SPIs.
 
-**Allowed dependencies:** None (no external runtime deps, not even Netty)
-
-### Branded Types (value records, Java 26)
-
-```java
-// All are value records — no object header, stack-allocatable, ==  is structural equality
-value record TenantId(UUID id)         { static TenantId of(UUID id) {...} }
-value record PartitionId(UUID id)      {}
-value record TopicId(UUID id)          {}
-value record BrokerId(UUID id)         {}
-value record ProducerId(long id)       {}
-value record Offset(long value)        { static final Offset EARLIEST = new Offset(-2L);
-                                         static final Offset LATEST   = new Offset(-1L); }
-value record TopicName(String value)   { /* validates: non-blank, max 249 chars */ }
-value record GroupId(String value)     {}
-value record Port(int value)           { /* validates: 1-65535 */ }
-value record ProducerEpoch(short value){}
-value record LeaderEpoch(int value)    {}
+### Packages
 ```
-
-**Why branded types?**
-- `PartitionId` and `TopicId` are both UUIDs but are incompatible at compile time
-- No raw `UUID`, `String`, `int`, `long` cross module API boundaries
-- Eliminates entire categories of type confusion bugs
-
-### Core Interfaces (sealed)
-
-```java
-// Messaging contract — implemented by DefaultBrokerEngine in ivy-broker
-sealed interface BrokerEngine permits DefaultBrokerEngine {
-    WriteResult       write(TenantId, List<PendingWrite>, SecurityContext);
-    FetchResult       fetch(TenantId, PartitionId, Offset, int maxBytes);
-    SubscriptionHandle subscribe(TenantId, PartitionId, Offset, Consumer<FlushEvent>);
-    void              commitOffset(TenantId, GroupId, PartitionId, Offset);
-    TopicMetadata     describeTopic(TenantId, TopicName);
-    List<TopicMetadata> listTopics(TenantId);
-    void              createTopic(TenantId, TopicName, int partitions, SecurityContext);
-}
-
-// Storage contract — implemented by PostgresStorageEngine in ivy-storage
-sealed interface StorageEngine permits PostgresStorageEngine {
-    void               append(PartitionId, List<MessageRecord>);
-    List<MessageRecord> fetchRange(PartitionId, Offset from, Offset to, int maxBytes);
-    Offset             highWatermark(PartitionId);
-    void               createSchema();
-    void               migrateSchema();
-}
-
-// Auth contract — implemented by DefaultAuthEngine in ivy-broker
-sealed interface AuthEngine permits DefaultAuthEngine {
-    SecurityContext authenticate(Credentials, TenantId);
-    void            authorize(SecurityContext, Operation, ResourceType, String resourceName);
-}
-```
-
-### Value Records (hot-path data types)
-
-```java
-// Java 26 value class — GC-free on hot path
-value class PendingWrite {
-    TenantId    tenantId;
-    PartitionId partitionId;
-    byte[]      key;
-    byte[]      value;
-    byte[]      headers;
-    long        timestampMs;
-    long        producerId;
-    short       producerEpoch;
-    int         sequence;
-    boolean     isTransactional;
-    byte        protocolId;
-    boolean     isDlq;
-}
-
-value class WriteResult {
-    PartitionId partitionId;
-    long        baseOffset;
-    int         recordCount;
-    long        logAppendTimeMs;
-    ErrorCode   errorCode;
-}
-
-value class FlushEvent {
-    PartitionId partitionId;
-    long        highWatermark;
-    long        lastStableOffset;
-}
-```
-
-### Config Types
-
-```java
-record BrokerConfig(
-    BrokerId        brokerId,
-    List<Port>      kafkaPorts,
-    Port            amqpPort,
-    Port            mqttPort,
-    Port            mysqlPort,
-    Port            pgwirePort,
-    Port            httpPort,
-    ClusterConfig   cluster,
-    StorageConfig   storage,
-    AuthConfig      auth
-) {}
-
-record ClusterConfig(
-    boolean          enabled,
-    byte[]           clusterSecret,
-    List<SeedBroker> seeds,
-    Duration         heartbeatInterval,
-    Duration         staleThreshold,
-    Duration         metadataRefreshInterval
-) {}
-
-record StorageConfig(
-    String    jdbcUrl,
-    String    username,
-    String    password,
-    int       maxPoolSize,
-    Duration  connectionTimeout
-) {}
-```
-
-### Environment Abstraction (deterministic testing)
-
-```java
-interface Environment {
-    Clock       clock();
-    IdGenerator idGenerator();   // UUID generation
-    Scheduler   scheduler();     // ScheduledExecutorService wrapper
-}
-
-// Production: real clock, random UUIDs, real scheduler
-class DefaultEnvironment implements Environment { ... }
-
-// Test: controlled clock, deterministic IDs, manual scheduler
-class SimulatedEnvironment implements Environment { ... }
+com.ivy.common/
+  types/        — TenantId, PartitionId, TopicId, BrokerId, Offset, TopicName, GroupId,
+                  Port, ProducerEpoch, LeaderEpoch, ProducerId
+  engine/       — BrokerEngine, StorageEngine, AuthEngine (sealed interfaces)
+  protocol/     — ProtocolBundle, ByteBufCodec, ProtocolBundleRegistry,
+                  InternalRequest (sealed), InternalResponse (sealed),
+                  CodecContext, DetectionRule, ProtocolPorts, DestinationParser
+  model/        — PendingWrite, WriteResult, FetchResult, FlushEvent (value records)
+  config/       — BrokerConfig, ClusterConfig, StorageConfig
+  error/        — ErrorCode (sealed), InternalErrorCode
+  env/          — Environment, DefaultEnvironment, SimulatedEnvironment
 ```
 
 ---
 
 ## ivy-storage
 
-**Purpose:** Data persistence layer. LogSegment read cache + PostgreSQL source of truth.
+**Purpose:** Data persistence. LogSegment cache + PostgreSQL source of truth.
 
-**Allowed dependencies:** `ivy-common`, JDBC (PostgreSQL driver, HikariCP)
+**Dependencies:** `ivy-common`, JDBC (postgresql driver + HikariCP)
 
-### LogSegment
-
-Append-only binary file. One per partition. Populated asynchronously after PG COMMIT.
-
+### Packages
 ```
-Key methods:
-  append(List<MessageRecord>)       → write records to end of current segment
-  read(Offset from, int maxBytes)   → read records starting at offset
-  highWatermark()                   → last appended offset
-  seal()                            → mark segment as immutable, start new one
-  delete()                          → remove segment file after retention expires
-```
-
-**File format:**
-```
-[message_size: 4 bytes]
-[crc32: 4 bytes]
-[offset: 8 bytes]
-[timestamp_ms: 8 bytes]
-[key_length: 4 bytes, -1 = null]
-[key: N bytes]
-[value_length: 4 bytes]
-[value: N bytes]
-[headers_length: 4 bytes]
-[headers: N bytes]
-```
-
-### OffsetIndex
-
-Sparse mmap'd index. One per LogSegment file.
-
-```
-Entry: [relative_offset: 4 bytes][file_position: 4 bytes]
-Density: 1 entry per 4KB of log data
-Lookup: binary search → O(log N)
-Max size: 10MB (10MB / 8 bytes = 1.25M entries = ~5GB of log data)
-```
-
-### MetadataSegment
-
-Same as LogSegment but uses log compaction — only the latest value per key is retained.
-Used for internal topics (`__consumer_offsets`, `__consumer_groups`, `__transactions`).
-
-### PostgresStorageEngine
-
-Implements `StorageEngine`. Primary persistence layer.
-
-```
-Key methods:
-  append(partitionId, records)    → binary COPY to messages table (within write transaction)
-  fetchRange(partitionId, from, to, maxBytes)  → SELECT from messages
-  highWatermark(partitionId)      → SELECT next_offset FROM partition_offsets
-  createSchema()                  → execute V1__initial_schema.sql
-  migrateSchema()                 → apply pending migration files
-
-Internal:
-  PgCopyOutputStream binaryWriter → streams records in PG binary COPY format
-  HikariDataSource  pool          → connection pool (max 20 connections per broker)
-  SchemaManager     migrations    → V{n}__{description}.sql files
-```
-
-### StorageFlusher
-
-Background service. Moves records from write path into LogSegment after PG COMMIT.
-
-```
-On WriteWorker.processBatch() success:
-  StorageFlusher.schedule(partitionId, baseOffset, records)
-    → added to per-partition queue
-    → background thread flushes every 200ms (configurable)
-    → LogSegment.append(records)
+com.ivy.storage/
+  segment/      — LogSegment, MetadataSegment, SegmentCleaner, LogSegmentStore
+  index/        — OffsetIndex (sparse, mmap'd, 8 bytes/entry)
+  postgres/     — PostgresStorageEngine (binary COPY write, SELECT fetch, DDL migrations)
+  flush/        — StorageFlusher (async 200ms background flush to LogSegment)
+  migration/    — SchemaManager (V{n}__*.sql versioned migrations)
 ```
 
 ---
 
 ## ivy-broker
 
-**Purpose:** Broker engine, write/read paths, clustering, DLQ, consumer groups, transactions.
+**Purpose:** Core engine. Write/read paths, clustering, DLQ, consumer groups, transactions.
 
-**Allowed dependencies:** `ivy-common`, `ivy-storage`, Netty (for inter-broker RPC only)
+**Dependencies:** `ivy-common`, `ivy-storage`, Netty (inter-broker RPC only)
 
-### engine/DefaultBrokerEngine
-
-Main implementation of `BrokerEngine`. Orchestrates all broker operations.
-
-```java
-// Routing: check ownership, write locally or forward
-WriteResult write(TenantId, List<PendingWrite>, SecurityContext):
-  for each partitionGroup(pendingWrites):
-    owner = hrwRouter.ownerOf(partitionId)
-    if owner == selfBrokerId:
-      writeAccumulator.accumulate(pendingWrites)
-    else:
-      forwardWriteManager.forward(owner, pendingWrites)
+### Packages
 ```
-
-### write/
-
-| Class | Responsibility |
-|-------|---------------|
-| `WriteAccumulator` | Per-partition batch accumulation (1K/1MB/5ms) |
-| `WriteWorker` | 4 threads, PG-first transaction, epoch-fenced |
-| `OffsetAllocator` | AtomicLong CAS for offset assignment (for single-broker mode) |
-| `DuplicateDetector` | `producer_state` lookup for idempotent deduplication |
-
-### read/
-
-| Class | Responsibility |
-|-------|---------------|
-| `ReadAccumulator` | Three-tier fetch: L1 LogSegment → L2 InterBroker → L3 PG |
-| `SubscriptionRegistry` | Map<PartitionId, Set<ConsumerHandle>> for push delivery |
-| `FlushEventDispatcher` | Notifies subscribers after WriteWorker PG COMMIT |
-
-### dlq/
-
-| Class | Responsibility |
-|-------|---------------|
-| `DlqRouter` | Evaluates trigger conditions, injects headers, routes to DLQ partition |
-| `DlqHeaderBuilder` | Builds `x-dlq-*` header set for DLQ messages |
-| `DlqTopicManager` | Auto-creates `__dlq.<topic>` on first DLQ write |
-| `DlqConfig` | Per-topic DLQ configuration (max retries, enabled) |
-
-### consumer/
-
-| Class | Responsibility |
-|-------|---------------|
-| `ConsumerGroupCoordinator` | Group state machine (EMPTY→PREP_REBALANCE→COMPLETING→STABLE→DEAD) |
-| `MemberManager` | Tracks group members, heartbeats, session timeouts |
-| `PartitionAssignor` | Range/roundrobin/sticky assignment strategies |
-| `OffsetManager` | Commit/fetch offsets from `consumer_offsets` table |
-| `DeliveryTracker` | Per-message delivery count tracking for DLQ trigger |
-
-### transaction/
-
-| Class | Responsibility |
-|-------|---------------|
-| `TransactionCoordinator` | ONGOING→PREPARE_COMMIT/ABORT→COMPLETE_* state machine |
-| `ProducerStateManager` | `producer_state` CRUD for idempotency |
-| `TransactionRepository` | PG CRUD for `transactions` table |
-| `ControlRecordWriter` | Writes COMMIT/ABORT control records to partitions |
-
-### cluster/
-
-| Class | Responsibility |
-|-------|---------------|
-| `HRWRouter` | HMAC-SHA-256 rendezvous hash, `ownerOf(partitionId)` |
-| `MetadataImage` | Immutable snapshot: activeBrokers, ownership, epochs |
-| `MetadataImageHolder` | VarHandle atomic reference for MetadataImage |
-| `MetadataPoller` | Polls PG every 30s to rebuild MetadataImage |
-| `ClusterManager` | Broker lifecycle: STARTING→ACTIVE→DRAINING→SHUTDOWN |
-| `HeartbeatWriter` | Periodic `UPDATE broker_registry SET last_heartbeat = now()` |
-| `HeartbeatMonitor` | Detects stale brokers, triggers BrokerFencingPipeline |
-| `BrokerFencingPipeline` | CAS fence → release partitions → broadcast → re-elect |
-| `ForwardWriteManager` | Routes ForwardWriteRequest to owner via RPC client |
-| `InterBrokerRpcServer` | Netty server on inter-broker port, dispatches inbound RPCs |
-| `InterBrokerRpcClient` | Per-peer Netty client, reconnect with backoff |
-| `InterBrokerMessage` | Sealed interface: ForwardWrite, ForwardFetch, MetadataBroadcast, Heartbeat |
-
-### auth/DefaultAuthEngine
-
-```java
-// Authentication: verify credentials against credentials table
-SecurityContext authenticate(Credentials credentials, TenantId tenantId):
-  → ScramAuthenticator.verify(username, password, tenantId)  (SCRAM-SHA-256)
-  → or PlainAuthenticator.verify(username, password, tenantId)
-  → return SecurityContext(principal, tenantId, roles)
-
-// Authorization: ACL check
-void authorize(SecurityContext ctx, Operation op, ResourceType type, String name):
-  → AclStore.evaluate(ctx.principal(), tenantId, op, type, name)
-  → throw AuthorizationException if denied
+com.ivy.broker/
+  engine/       — DefaultBrokerEngine (implements BrokerEngine)
+  write/        — WriteAccumulator, WriteWorker (4 threads, PG-first), OffsetAllocator,
+                  DuplicateDetector
+  read/         — ReadAccumulator (L1→L2→L3), SubscriptionRegistry, FlushEventDispatcher
+  dlq/          — DlqRouter, DlqHeaderBuilder, DlqTopicManager, DlqConfig
+  consumer/     — ConsumerGroupCoordinator, MemberManager, PartitionAssignor, OffsetManager,
+                  DeliveryTracker
+  transaction/  — TransactionCoordinator, ProducerStateManager, TransactionRepository,
+                  ControlRecordWriter
+  auth/         — DefaultAuthEngine (implements AuthEngine), ScramAuthenticator, AclStore,
+                  AclAuthorizer, TokenBucketQuotaManager
+  cluster/      — HRWRouter, MetadataImage, MetadataImageHolder, MetadataPoller,
+                  ClusterManager, HeartbeatWriter, HeartbeatMonitor,
+                  BrokerFencingPipeline, ForwardWriteManager,
+                  InterBrokerRpcServer, InterBrokerRpcClient,
+                  InterBrokerMessage (sealed)
 ```
 
 ---
 
-## ivy-codec
+## ivy-protocol-kafka
 
-**Purpose:** Wire protocol encoding and decoding. No business logic.
+**Purpose:** Kafka wire protocol — codec, all request handlers, ProtocolBundle.
 
-**Allowed dependencies:** `ivy-common`, Netty buffers only
+**Dependencies:** `ivy-common`, `ivy-broker`, Netty, `kafka-clients:4.2.0` (test only)
 
-### Per-Protocol Codec
-
-Each codec has two responsibilities:
-1. **Decoder:** `ByteBuf` → protocol-specific request/frame object
-2. **Encoder:** response/frame object → `ByteBuf`
-
-Package structure mirrors `clustering` — one sub-package per protocol:
-
+### Package Structure
 ```
-com.ivy.codec/
-  kafka/
-    KafkaRequestDecoder    — reads request header (apiKey, apiVersion, correlationId) + body
-    KafkaResponseEncoder   — writes response header (correlationId) + body
-    KafkaApiVersions       — supported API key × version table
-    KafkaRequest           — sealed interface for all request types
-    KafkaResponse          — sealed interface for all response types
+com.ivy.protocol.kafka/
+  KafkaCodec.java              — implements ByteBufCodec; frameLength, decode, encode
+  KafkaRequestParser.java      — ApiKey + version deserialization → InternalRequest
+  KafkaResponseSerializer.java — InternalResponse → wire bytes per API version
+  KafkaFraming.java            — 4-byte big-endian frame length prefix detection
+  KafkaVersions.java           — supported API key versions table
+  KafkaNamespaceStrategy.java  — implements DestinationParser
+  KafkaErrors.java             — Ivy ErrorCode → Kafka error code mapping
+  KafkaFetchMetadata.java      — per-fetch session state (epoch, fetch session id)
+  KafkaProduceMetadata.java    — per-produce metadata (acks, timeout)
 
-  amqp/                    ← AMQP 0-9-1
-    Amqp091FrameDecoder    — reads [frame_type:1][channel:2][payload_size:4][payload:N][0xCE]
-    Amqp091FrameEncoder    — writes same
-    Amqp091MethodCodec     — encodes/decodes class+method+arguments
-    Amqp091Frame           — sealed interface (MethodFrame, HeaderFrame, BodyFrame, HeartbeatFrame)
+  handler/
+    KafkaRequestDispatcher.java    — routes decoded InternalRequest to sub-handlers
+    KafkaProduceHandler.java       — Produce v3-v9
+    KafkaFetchHandler.java         — Fetch v4-v15
+    KafkaMetadataHandler.java      — Metadata v1-v12, DescribeCluster v0-v1
+    KafkaOffsetCommitHandler.java  — OffsetCommit v0-v8
+    KafkaOffsetFetchHandler.java   — OffsetFetch v0-v8
+    KafkaGroupHandler.java         — JoinGroup, SyncGroup, Heartbeat, LeaveGroup, ListGroups, DescribeGroups
+    KafkaCoordinatorHandler.java   — FindCoordinator (group + transaction)
+    KafkaTransactionHandler.java   — InitProducerId, AddPartitionsToTxn, EndTxn, TxnOffsetCommit
+    KafkaAdminHandler.java         — CreateTopics, DeleteTopics, CreatePartitions
+    KafkaConfigHandler.java        — DescribeConfigs, AlterConfigs
+    KafkaSaslAuthHandler.java      — SaslHandshake v0-v1, SaslAuthenticate v0-v2, ApiVersions
+    KafkaListOffsetsHandler.java   — ListOffsets v1-v7
+    KafkaProtocolBundle.java       — implements ProtocolBundle
+                                     detection: first 4 bytes = request size (MSB ~0)
+                                     ports: 9092 (plain), 9093 (TLS)
+```
 
-  amqp10/                  ← AMQP 1.0
-    Amqp10FrameDecoder     — reads [size:4][doff:1][type:1][type-specific:2][payload]
-    Amqp10FrameEncoder     — writes same
-    Amqp10TypeCodec        — AMQP type system (described types, lists, maps, primitives)
-    Amqp10Performative     — sealed interface (Open, Begin, Attach, Flow, Transfer, Disposition, Detach, End, Close)
-    Amqp10MessageCodec     — message sections (header, properties, application-properties, body, footer)
+### ServiceLoader Registration
+```
+META-INF/services/com.ivy.common.protocol.ProtocolBundle:
+  com.ivy.protocol.kafka.handler.KafkaProtocolBundle
+```
 
-  mqtt/                    ← MQTT 3.1.1 AND 5.0 share base; 5.0 extends
-    MqttDecoder            — reads [fixed_header:1][remaining_length:1-4][payload:N]
-    MqttEncoder            — writes same
-    Mqtt311Packet          — sealed interface for all MQTT 3.1.1 packet types
-    Mqtt5Packet            — sealed interface extending 3.1.1 with 5.0 properties
-    Mqtt5PropertiesCodec   — encodes/decodes MQTT 5.0 property sets
+---
 
-  mysql/
-    MySqlHandshakeEncoder  — writes server greeting (HandshakeV10)
-    MySqlPacketDecoder     — reads [length:3][sequence:1][payload:N]
-    MySqlResultSetEncoder  — writes ColumnDefinition41 + rows + EOF
-    MySqlOkErrEncoder      — writes OK_Packet and ERR_Packet
+## ivy-protocol-amqp
 
-  pg/                      ← PgWire
-    PgStartupDecoder       — reads StartupMessage (length + protocol version + params)
-    PgMessageDecoder       — reads [type:1][length:4][payload:N]
-    PgMessageEncoder       — writes same
-    PgRowDescEncoder       — writes RowDescription for a given schema
-    PgDataRowEncoder       — writes DataRow for each result record
-    PgErrorEncoder         — writes ErrorResponse with SQLSTATE fields
+**Purpose:** AMQP 0-9-1 and AMQP 1.0 — both versions in one module, separate sub-packages.
+
+**Dependencies:** `ivy-common`, `ivy-broker`, Netty, `protonj2:1.1.0` (AMQP 1.0 type system)
+
+### Package Structure
+```
+com.ivy.protocol.amqp/                          ← AMQP 0-9-1
+  Amqp091Codec.java            — frame constants, encode/decode methods
+  AmqpFrame.java               — sealed: MethodFrame, HeaderFrame, BodyFrame, HeartbeatFrame
+  Amqp091NamespaceStrategy.java — implements DestinationParser
+  AmqpBasicPublishData.java    — data classes for each method
+  AmqpBasicConsumeData.java
+  AmqpQueueDeclareData.java
+  AmqpExchangeDeclareData.java
+  ... (other method data classes)
+
+  handler/
+    Amqp091FrameDecoder.java       — ByteToMessageDecoder: splits frames from TCP stream
+    Amqp091RequestHandler.java     — main ChannelInboundHandlerAdapter, dispatches by method
+    Amqp091ConnectionHandler.java  — Connection.Start/Tune/Open/Close + SASL
+    Amqp091ChannelHandler.java     — Channel.Open/Close
+    Amqp091ExchangeHandler.java    — Exchange.Declare/Delete
+    Amqp091QueueHandler.java       — Queue.Declare/Bind/Unbind/Purge/Delete
+    Amqp091PublishHandler.java     — Basic.Publish + publisher confirms
+    Amqp091ConsumeHandler.java     — Basic.Consume/Cancel, Basic.Get
+    Amqp091AckHandler.java         — Basic.Ack/Nack/Reject → DlqRouter on requeue=false
+    Amqp091TxHandler.java          — Tx.Select/Commit/Rollback
+    Amqp091SessionState.java       — per-channel: exchanges, queues, consumers, confirm mode
+    Amqp091ProtocolBundle.java     — implements ProtocolBundle
+                                     detection: "AMQP" + bytes[4-7] = {0,0,9,1}
+                                     ports: 5672 (plain), 5671 (TLS)
+
+com.ivy.protocol.amqp10/                        ← AMQP 1.0
+  Amqp10Codec.java             — AMQP 1.0 type system encoding/decoding
+  Amqp10FrameHeader.java       — [size:4][doff:1][type:1][type-specific:2]
+  Amqp10TypeCodec.java         — described types, composite types, primitive encoding
+  Amqp10MessageCodec.java      — message sections: header, properties, app-properties, body
+  Amqp10NamespaceStrategy.java — implements DestinationParser
+
+  handler/
+    Amqp10FrameDecoder.java        — ByteToMessageDecoder for AMQP 1.0 frames
+    Amqp10RequestHandler.java      — main dispatcher (SASL frames + AMQP frames)
+    Amqp10ConnectionHandler.java   — Open/Close performatives + SASL exchange
+    Amqp10SessionHandler.java      — Begin/End, session-level flow
+    Amqp10SenderLinkHandler.java   — Attach(role=sender), Transfer ingestion, Disposition reply
+    Amqp10ReceiverLinkHandler.java — Attach(role=receiver), Flow credit, Disposition settlement
+    Amqp10SessionState.java        — per-session: links, delivery-id tracking, link-credit map
+    Amqp10ProtocolBundle.java      — implements ProtocolBundle
+                                     detection: "AMQP" + bytes[4-7] = {0,1,0,0} or {3,1,0,0}
+                                     ports: 5673 (plain) or shared 5672 (negotiated post-magic)
+```
+
+### ServiceLoader Registration
+```
+META-INF/services/com.ivy.common.protocol.ProtocolBundle:
+  com.ivy.protocol.amqp.handler.Amqp091ProtocolBundle
+  com.ivy.protocol.amqp10.handler.Amqp10ProtocolBundle
+```
+
+---
+
+## ivy-protocol-mqtt
+
+**Purpose:** MQTT 3.1.1 and 5.0 — one module, version detected from CONNECT packet.
+
+**Dependencies:** `ivy-common`, `ivy-broker`, Netty (no external MQTT library — pure Java)
+
+### Package Structure
+```
+com.ivy.protocol.mqtt/
+  MqttFraming.java             — variable-length integer frame boundary detection
+  MqttPacketType.java          — enum: CONNECT=1, PUBLISH=3, SUBSCRIBE=8, ...
+  MqttVersion.java             — enum: V3_1_1(4), V5(5); detected from CONNECT byte[9]
+  MqttQoS.java                 — enum: AT_MOST_ONCE(0), AT_LEAST_ONCE(1), EXACTLY_ONCE(2)
+  MqttConnectCodec.java        — encode/decode CONNECT + CONNACK (both versions)
+  MqttPublishCodec.java        — encode/decode PUBLISH + PUBACK/PUBREC/PUBREL/PUBCOMP
+  MqttSubscribeCodec.java      — encode/decode SUBSCRIBE + SUBACK, UNSUBSCRIBE + UNSUBACK
+  MqttSimpleCodec.java         — PINGREQ/PINGRESP, DISCONNECT
+  Mqtt5PropertiesCodec.java    — MQTT 5.0 property set encoding/decoding
+  MqttNamespaceStrategy.java   — implements DestinationParser (slash → dot conversion)
+  MqttConnectData.java         — CONNECT payload: clientId, will, auth, cleanSession, keepAlive
+  MqttPublishData.java         — PUBLISH payload: topic, payload, qos, retain, packetId
+  MqttSubscribeData.java       — SUBSCRIBE payload: topicFilters + QoS options
+
+  handler/
+    MqttFrameDecoder.java          — ByteToMessageDecoder: splits MQTT packets from TCP stream
+    MqttRequestHandler.java        — top-level dispatcher; detects version at CONNECT
+    MqttConnectHandler.java        — CONNECT / CONNACK (shared 3.1.1 + 5.0 logic)
+    MqttPublishHandler.java        — PUBLISH + full QoS 0/1/2 state machine
+    MqttSubscribeHandler.java      — SUBSCRIBE / SUBACK, topic filter wildcard matching
+    MqttUnsubscribeHandler.java    — UNSUBSCRIBE / UNSUBACK
+    MqttPingHandler.java           — PINGREQ / PINGRESP
+    MqttDisconnectHandler.java     — DISCONNECT (3.1.1 + 5.0 reason codes)
+    Mqtt5AuthHandler.java          — AUTH packet for enhanced auth (MQTT 5.0 only)
+    MqttSharedSubHandler.java      — $share/<group>/<filter> → ConsumerGroupCoordinator
+    MqttRetainedMessageStore.java  — retained message storage + on-subscribe replay
+    MqttTopicMatcher.java          — wildcard matching: '+' (single-level), '#' (multi-level)
+    MqttSessionManager.java        — session state lifecycle (clean vs persistent)
+    MqttSessionState.java          — per-connection: will, subscriptions, QoS 2 state,
+                                     topic aliases (5.0), session-expiry, receive-maximum
+    MqttProtocolBundle.java        — implements ProtocolBundle
+                                     detection: first byte 0x10 (CONNECT control packet)
+                                     version (3.1.1 vs 5.0) resolved inside CONNECT handler
+                                     ports: 1883/1884 (plain), 8883/8884 (TLS)
+```
+
+### Version Negotiation Detail
+
+MQTT 3.1.1 and 5.0 share the same `MqttFrameDecoder` and `MqttRequestHandler`.
+Version is detected inside `MqttConnectHandler` by reading the protocol-level byte from the CONNECT payload:
+
+```java
+// Inside MqttConnectHandler.handle(MqttConnectData connect):
+MqttVersion version = switch (connect.protocolLevel()) {
+    case 4  -> MqttVersion.V3_1_1;
+    case 5  -> MqttVersion.V5;
+    default -> throw new UnsupportedProtocolVersionException(connect.protocolLevel());
+};
+ctx.channel().attr(MQTT_VERSION_KEY).set(version);
+```
+
+After CONNECT, `MqttRequestHandler` reads the version from the channel attribute and delegates
+to version-appropriate sub-handlers where behaviour differs (properties parsing, reason codes, etc.).
+
+### ServiceLoader Registration
+```
+META-INF/services/com.ivy.common.protocol.ProtocolBundle:
+  com.ivy.protocol.mqtt.handler.MqttProtocolBundle
+```
+
+---
+
+## ivy-protocol-postgresql
+
+**Purpose:** PgWire read-only SQL view of broker state.
+
+**Dependencies:** `ivy-common`, `ivy-broker`, Netty
+
+### Package Structure
+```
+com.ivy.protocol.pg/
+  PgWireCodec.java             — PostgreSQL wire protocol encode/decode
+  PgStartupMessage.java        — StartupMessage + SSLRequest handling
+  PgWireNamespaceStrategy.java — implements DestinationParser
+  PgParseData.java             — PARSE (prepared statement)
+  PgBindData.java              — BIND + EXECUTE
+  PgMessage.java               — sealed: Query, Parse, Bind, Execute, Describe, Sync, Terminate
+
+  handler/
+    PgWireFrameDecoder.java        — ByteToMessageDecoder: startup vs regular message framing
+    PgWireRequestHandler.java      — main dispatcher
+    PgWireStartupHandler.java      — StartupMessage, SSLRequest, Auth (MD5/SCRAM)
+    PgWireSimpleQueryHandler.java  — Query message → SqlQueryParser → execute → DataRow response
+    PgWirePreparedStmtHandler.java — Parse/Bind/Execute/Describe flow
+    PgWireQueryExecutor.java       — SqlQueryParser → BrokerEngine.fetch() or PG metadata query
+    SqlQueryParser.java            — minimal SQL parser: SELECT, SHOW TABLES, DESCRIBE
+    SqlQuery.java                  — sealed: SelectTopic, ShowTables, DescribeTable,
+                                     SelectMetadata, Unsupported
+    PgWireSessionState.java        — per-connection: auth state, parameter status map,
+                                     prepared statements
+    PgWireProtocolBundle.java      — implements ProtocolBundle
+                                     detection: first 4 bytes = length, bytes[4-7] = 0x00030000
+                                     (protocol version 3.0 = 196608)
+                                     ports: 5432 (plain), 5433 (TLS)
+```
+
+### ServiceLoader Registration
+```
+META-INF/services/com.ivy.common.protocol.ProtocolBundle:
+  com.ivy.protocol.pg.handler.PgWireProtocolBundle
+```
+
+---
+
+## ivy-protocol-mysql
+
+**Purpose:** MySQL wire read-only SQL view of broker state.
+
+**Dependencies:** `ivy-common`, `ivy-broker`, Netty
+
+### Package Structure
+```
+com.ivy.protocol.mysql/
+  MysqlWireCodec.java          — MySQL wire protocol encode/decode
+  MySqlNamespaceStrategy.java  — implements DestinationParser
+  MySqlColumnDef.java          — column metadata (ColumnDefinition41)
+  MysqlAuthResponse.java       — auth handshake response data
+
+  handler/
+    MysqlFrameDecoder.java         — ByteToMessageDecoder: [length:3][seq:1][payload] framing
+    MysqlRequestHandler.java       — main dispatcher
+    MySqlHandshakeHandler.java     — HandshakeV10 → HandshakeResponse41 → OK/ERR
+    MySqlComQueryHandler.java      — COM_QUERY text protocol → SqlQueryParser
+    MySqlComStmtPrepareHandler.java — COM_STMT_PREPARE (prepared statements)
+    MySqlComStmtExecuteHandler.java — COM_STMT_EXECUTE (binary protocol)
+    MySqlQueryExecutor.java        — SqlQueryParser → BrokerEngine.fetch() or PG metadata query
+    SqlQueryParser.java            — shared with pg: SELECT, SHOW TABLES, DESCRIBE
+    MySqlSessionState.java         — per-connection: auth state, capabilities
+    MySqlProtocolBundle.java       — implements ProtocolBundle
+                                     detection: server-speaks-first HandshakeV10
+                                       (seq=0, packet_type=0x0A)
+                                     ports: 3306 (plain), 3307 (TLS)
+```
+
+### ServiceLoader Registration
+```
+META-INF/services/com.ivy.common.protocol.ProtocolBundle:
+  com.ivy.protocol.mysql.handler.MySqlProtocolBundle
 ```
 
 ---
 
 ## ivy-server
 
-**Purpose:** Assembly point. Netty pipeline, protocol handlers, `BrokerMain`.
+**Purpose:** Thin assembly. Auto-discovers protocols via `ProtocolBundleRegistry`. No handler logic.
 
-**Allowed dependencies:** All modules. This is the only module with a `main()`.
+**Dependencies:** All modules above.
 
-### BrokerMain
+### Package Structure
+```
+com.ivy.server/
+  BrokerMain.java              — entry point, manual IoC assembly (no DI framework)
+  NettyBrokerServer.java       — Netty ServerBootstrap, EventLoopGroup lifecycle
+  NettyPipelineFactory.java    — builds per-connection pipeline using ProtocolBundleRegistry
+  ProtocolDetector.java        — peeks first 8 bytes, selects ProtocolBundle
+  TenantResolverHandler.java   — SNI hostname → TenantId
+  ConnectionLimitHandler.java  — max connections per tenant
+  FlowControlHandler.java      — channel backpressure (high/low watermarks)
+  ServerExceptionHandler.java  — catch-all, log + graceful close
+  GracefulShutdown.java        — drain → release partitions → close connections → exit
+  BrokerConfigWatcher.java     — hot-reload YAML config
+  suspension/
+    SuspensionManager.java     — per-tenant broker suspension
+```
 
-Manual IoC — no DI framework. Pure constructor injection.
+### BrokerMain Assembly
 
 ```java
 public static void main(String[] args) {
     BrokerConfig config = ConfigParser.parse(args);
-    Environment env = new DefaultEnvironment();
+    Environment  env    = new DefaultEnvironment();
 
-    // Storage
-    var dataSource     = HikariDataSource(config.storage());
-    var storageEngine  = new PostgresStorageEngine(dataSource);
+    // --- Storage ---
+    var dataSource    = HikariDataSourceFactory.create(config.storage());
+    var storageEngine = new PostgresStorageEngine(dataSource);
     storageEngine.migrateSchema();
 
     var logSegmentStore = new LogSegmentStore(config.storage().dataDir());
     var storageFlusher  = new StorageFlusher(logSegmentStore);
 
-    // Broker engine
-    var metadataImage  = new MetadataImageHolder(MetadataImage.empty());
-    var hrwRouter      = new HRWRouter(config.cluster().clusterSecret(), metadataImage);
+    // --- Broker ---
+    var metadataImage    = new MetadataImageHolder(MetadataImage.empty());
+    var hrwRouter        = new HRWRouter(config.cluster().clusterSecret(), metadataImage);
     var writeAccumulator = new WriteAccumulator(config.broker().write());
-    var writeWorker    = new WriteWorker(storageEngine, storageFlusher, writeAccumulator);
-    var readAccumulator = new ReadAccumulator(logSegmentStore, storageEngine);
-    var dlqRouter      = new DlqRouter(config.broker().dlq());
+    var writeWorker      = new WriteWorker(storageEngine, storageFlusher, writeAccumulator);
+    var readAccumulator  = new ReadAccumulator(logSegmentStore, storageEngine);
+    var dlqRouter        = new DlqRouter(config.broker().dlq());
     var groupCoordinator = new ConsumerGroupCoordinator(storageEngine, env);
-    var txCoordinator  = new TransactionCoordinator(storageEngine, env);
-    var authEngine     = new DefaultAuthEngine(dataSource);
+    var txCoordinator    = new TransactionCoordinator(storageEngine, env);
+    var authEngine       = new DefaultAuthEngine(dataSource);
+    var clusterManager   = new ClusterManager(config, dataSource, metadataImage, hrwRouter, env);
+    var forwardMgr       = new ForwardWriteManager(hrwRouter, clusterManager.rpcClients());
 
-    // Clustering
-    var clusterManager = new ClusterManager(config, dataSource, metadataImage, env);
-    var forwardMgr     = new ForwardWriteManager(hrwRouter, /* rpc clients built by clusterManager */);
-
-    var brokerEngine   = new DefaultBrokerEngine(
+    var brokerEngine = new DefaultBrokerEngine(
         writeAccumulator, writeWorker, readAccumulator, dlqRouter,
         groupCoordinator, txCoordinator, hrwRouter, forwardMgr, storageEngine);
 
-    // Protocol codecs (one instance per protocol variant)
-    var kafkaCodec     = new KafkaRequestDecoder();
-    var amqp091Codec   = new Amqp091FrameDecoder();
-    var amqp10Codec    = new Amqp10FrameDecoder();
-    var mqtt311Codec   = new MqttDecoder(MqttVersion.V3_1_1);
-    var mqtt5Codec     = new MqttDecoder(MqttVersion.V5);
-    var mysqlCodec     = new MySqlPacketDecoder();
-    var pgwireCodec    = new PgStartupDecoder();
+    // --- Protocol auto-discovery ---
+    // Each ivy-protocol-* module registers itself in META-INF/services/
+    var protocolRegistry = ProtocolBundleRegistry.fromServiceLoader();
+    log.info("Loaded {} protocol bundles: {}",
+        protocolRegistry.listAll().size(),
+        protocolRegistry.listAll().stream().map(b -> b.protocolId().name()).toList());
 
-    // Handlers — one per protocol variant, each in its own package
-    var kafkaHandler   = new KafkaRequestHandler(brokerEngine, authEngine, kafkaCodec);
-    var amqp091Handler = new Amqp091RequestHandler(brokerEngine, authEngine, amqp091Codec);
-    var amqp10Handler  = new Amqp10RequestHandler(brokerEngine, authEngine, amqp10Codec);
-    var mqtt311Handler = new Mqtt311RequestHandler(brokerEngine, authEngine, mqtt311Codec);
-    var mqtt5Handler   = new Mqtt5RequestHandler(brokerEngine, authEngine, mqtt5Codec);
-    var mysqlHandler   = new MySqlRequestHandler(brokerEngine, authEngine, mysqlCodec);
-    var pgwireHandler  = new PgWireRequestHandler(brokerEngine, authEngine, pgwireCodec);
+    // Inject broker dependencies into each bundle's handlers
+    protocolRegistry.listAll().forEach(bundle ->
+        bundle.injectDependencies(brokerEngine, authEngine, config));
 
-    // Netty
-    var pipelineFactory = new NettyPipelineFactory(
-        kafkaHandler, amqp091Handler, amqp10Handler,
-        mqtt311Handler, mqtt5Handler, mysqlHandler, pgwireHandler, config);
-    var server = new NettyBrokerServer(pipelineFactory, config);
+    // --- Netty ---
+    var pipelineFactory = new NettyPipelineFactory(protocolRegistry, config);
+    var server          = new NettyBrokerServer(pipelineFactory, config);
 
-    // Lifecycle
+    // --- Lifecycle ---
     clusterManager.start();
     server.start();
     Runtime.getRuntime().addShutdownHook(new Thread(() -> {
         clusterManager.drainAndStop();
         server.stop();
+        dataSource.close();
     }));
 }
 ```
 
-### NettyPipelineFactory
-
-Builds the Netty pipeline per accepted connection:
+### Netty Pipeline (per connection)
 
 ```
-EventLoop thread:
-  [TLS SslHandler]             optional, per-port config
-  [TenantResolverHandler]      SNI → TenantId (stored in channel attr)
-  [ConnectionLimitHandler]     max connections per tenant
-  [ProtocolDetector]           peek 8 bytes → identify protocol
-  [ProtocolNegotiationHandler] install protocol-specific codec + handler
-  [FlowControlHandler]         high/low watermark backpressure
-  [ServerExceptionHandler]     catch-all, log + close
+[SslHandler]               optional, per-port TLS config
+[TenantResolverHandler]    SNI hostname → TenantId (stored as ChannelAttr)
+[ConnectionLimitHandler]   max connections per tenant
+[ProtocolDetector]         peeks 8 bytes → selects matching ProtocolBundle
+                           → installs bundle.newFrameDecoder() + bundle.newRequestHandler()
+[FlowControlHandler]       high/low watermark backpressure
+[ServerExceptionHandler]   catch-all, log + graceful close
 ```
 
-### Handler Package Structure
+---
 
-Mirrors the `clustering` project: one sub-package per protocol in `com.ivy.server.handler/`:
+## Protocol Dependencies Summary
 
-```
-com.ivy.server.handler/
-  kafka/
-    KafkaRequestHandler        — main dispatcher
-    KafkaProduceHandler        — Produce API (v3-v9)
-    KafkaFetchHandler          — Fetch API (v4-v15)
-    KafkaMetadataHandler       — Metadata, DescribeCluster
-    KafkaConsumerGroupHandler  — JoinGroup, SyncGroup, Heartbeat, LeaveGroup, OffsetCommit/Fetch
-    KafkaTransactionHandler    — InitProducerId, AddPartitions, EndTxn, TxnOffsetCommit
-    KafkaAdminHandler          — CreateTopics, DeleteTopics, DescribeConfigs
-    KafkaSaslHandler           — SaslHandshake, SaslAuthenticate
+| Module | ivy-common | ivy-storage | ivy-broker | Netty | External |
+|--------|-----------|------------|-----------|-------|----------|
+| ivy-protocol-kafka | ✓ | — | ✓ | ✓ | `kafka-clients:4.2.0` (test only) |
+| ivy-protocol-amqp | ✓ | — | ✓ | ✓ | `protonj2:1.1.0` (AMQP 1.0 types) |
+| ivy-protocol-mqtt | ✓ | — | ✓ | ✓ | none (pure Java) |
+| ivy-protocol-postgresql | ✓ | — | ✓ | ✓ | none (pure Java) |
+| ivy-protocol-mysql | ✓ | — | ✓ | ✓ | `mysql-connector-j` (test only) |
 
-  amqp091/
-    Amqp091RequestHandler      — main dispatcher
-    Amqp091ConnectionHandler   — Connection.Start/Tune/Open/Close
-    Amqp091ChannelHandler      — Channel.Open/Close
-    Amqp091ExchangeHandler     — Exchange.Declare/Delete
-    Amqp091QueueHandler        — Queue.Declare/Bind/Unbind/Purge/Delete
-    Amqp091BasicHandler        — Basic.Publish/Consume/Get/Ack/Nack/Reject/Cancel/Qos
-    Amqp091ConfirmHandler      — Confirm.Select, Basic.Ack/Nack for publisher confirms
-    Amqp091TxHandler           — Tx.Select/Commit/Rollback
-    Amqp091SessionState        — per-channel: exchanges, queues, consumers, confirms
+---
 
-  amqp10/
-    Amqp10RequestHandler       — main dispatcher
-    Amqp10ConnectionHandler    — Open/Close performatives, SASL exchange
-    Amqp10SessionHandler       — Begin/End, link management
-    Amqp10SenderLinkHandler    — Attach(sender), Transfer, Disposition settlement
-    Amqp10ReceiverLinkHandler  — Attach(receiver), Flow credit management, Disposition
-    Amqp10SessionState         — per-session: links, delivery tracking, flow control
-
-  mqtt/
-    Mqtt311RequestHandler      — main dispatcher for MQTT 3.1.1
-    Mqtt5RequestHandler        — extends Mqtt311RequestHandler with 5.0 features
-    MqttConnectHandler         — CONNECT / CONNACK (shared, version-dispatched)
-    MqttPublishHandler         — PUBLISH + QoS 0/1/2 flows (PUBACK, PUBREC, PUBREL, PUBCOMP)
-    MqttSubscribeHandler       — SUBSCRIBE / SUBACK, topic filter matching
-    MqttUnsubscribeHandler     — UNSUBSCRIBE / UNSUBACK
-    Mqtt5AuthHandler           — AUTH packet (MQTT 5.0 enhanced auth)
-    MqttSessionState           — per-connection: will, subscriptions, QoS 2 state, topic aliases (5.0)
-    MqttSharedSubHandler       — $share/ prefix → ConsumerGroupCoordinator (MQTT 5.0)
-
-  mysql/
-    MySqlRequestHandler        — handshake + COM_QUERY dispatch
-    MySqlQueryExecutor         — SqlQueryParser → BrokerEngine.fetch() or metadata PG query
-    MySqlSessionState          — per-connection auth state
-
-  pgwire/
-    PgWireRequestHandler       — startup + simple query dispatch
-    PgWireQueryExecutor        — SqlQueryParser → BrokerEngine.fetch() or metadata PG query
-    PgWireSessionState         — per-connection auth state, parameter status
-```
-
-### Per-Protocol Handler Pattern
-
-Each handler implements `ChannelInboundHandlerAdapter`:
+## Full File Structure
 
 ```
-channelRead(ctx, msg):
-  decoded = codec.decode(msg)
-  tenantId = ctx.channel().attr(TENANT_ID_KEY).get()
-  secCtx = sessionState.getOrCreate(ctx.channel())
-
-  switch (decoded) {
-    // Each handler delegates to sub-handlers by request type:
-    case Kafka:   kafkaRequestDispatcher.dispatch(decoded, ctx, secCtx)
-    case Amqp091: amqp091Dispatcher.dispatch(decoded, ctx, secCtx)
-    case Amqp10:  amqp10Dispatcher.dispatch(decoded, ctx, secCtx)
-    case Mqtt311: mqttDispatcher.dispatch(decoded, ctx, secCtx)
-    case Mqtt5:   mqtt5Dispatcher.dispatch(decoded, ctx, secCtx)
-    case MySql:   mysqlQueryExecutor.execute(decoded, ctx, secCtx)
-    case PgWire:  pgwireQueryExecutor.execute(decoded, ctx, secCtx)
-  }
-
-  response = brokerEngine.write(...) or brokerEngine.fetch(...)
-  encoded = codec.encode(response)
-  ctx.writeAndFlush(encoded)
-```
-
-### GracefulShutdown
-
-```
-1. Mark broker status = DRAINING in broker_registry
-2. Stop accepting new connections (close server socket)
-3. Wait for in-flight WriteWorker batches to complete (max 30s)
-4. Flush StorageFlusher (drain async LogSegment writes)
-5. Release partition ownership (UPDATE partition_offsets SET leader_id = NULL)
-6. Broadcast MetadataUpdateBroadcast
-7. Close all client connections
-8. Mark broker status = SHUTDOWN
-9. Close HikariCP pool
-10. Exit
+autoresearch-v8/
+├── pom.xml                              # parent POM, BOM
+├── ivy-common/
+│   └── src/main/java/com/ivy/common/
+│       ├── types/                       # branded value records
+│       ├── engine/                      # BrokerEngine, StorageEngine, AuthEngine
+│       ├── protocol/                    # ProtocolBundle, ByteBufCodec, ProtocolBundleRegistry,
+│       │                                # InternalRequest (sealed), CodecContext
+│       ├── model/                       # PendingWrite, WriteResult, FetchResult, FlushEvent
+│       ├── config/                      # BrokerConfig, ClusterConfig, StorageConfig
+│       └── env/                         # Environment, DefaultEnvironment, SimulatedEnvironment
+│
+├── ivy-storage/
+│   └── src/main/java/com/ivy/storage/
+│       ├── segment/                     # LogSegment, MetadataSegment, LogSegmentStore
+│       ├── index/                       # OffsetIndex (mmap'd)
+│       ├── postgres/                    # PostgresStorageEngine
+│       ├── flush/                       # StorageFlusher
+│       └── migration/                   # SchemaManager + V{n}__*.sql
+│
+├── ivy-broker/
+│   └── src/main/java/com/ivy/broker/
+│       ├── engine/                      # DefaultBrokerEngine
+│       ├── write/                       # WriteAccumulator, WriteWorker
+│       ├── read/                        # ReadAccumulator, SubscriptionRegistry
+│       ├── dlq/                         # DlqRouter, DlqHeaderBuilder, DlqTopicManager
+│       ├── consumer/                    # ConsumerGroupCoordinator, OffsetManager
+│       ├── transaction/                 # TransactionCoordinator, ProducerStateManager
+│       ├── auth/                        # DefaultAuthEngine, ScramAuthenticator, AclAuthorizer
+│       └── cluster/                     # HRWRouter, ClusterManager, HeartbeatWriter/Monitor,
+│                                        # BrokerFencingPipeline, ForwardWriteManager,
+│                                        # InterBrokerRpcServer/Client, MetadataImage
+│
+├── ivy-protocol-kafka/
+│   └── src/main/java/com/ivy/protocol/kafka/
+│       ├── KafkaCodec.java
+│       ├── KafkaRequestParser.java
+│       ├── KafkaResponseSerializer.java
+│       ├── KafkaFraming.java
+│       ├── KafkaVersions.java
+│       ├── KafkaNamespaceStrategy.java
+│       └── handler/
+│           ├── KafkaRequestDispatcher.java
+│           ├── KafkaProduceHandler.java
+│           ├── KafkaFetchHandler.java
+│           ├── KafkaMetadataHandler.java
+│           ├── KafkaGroupHandler.java
+│           ├── KafkaTransactionHandler.java
+│           ├── KafkaAdminHandler.java
+│           ├── KafkaSaslAuthHandler.java
+│           └── KafkaProtocolBundle.java
+│
+├── ivy-protocol-amqp/
+│   └── src/main/java/com/ivy/protocol/
+│       ├── amqp/                        # AMQP 0-9-1
+│       │   ├── Amqp091Codec.java
+│       │   ├── AmqpFrame.java
+│       │   ├── Amqp091NamespaceStrategy.java
+│       │   ├── Amqp*Data.java           # method data classes
+│       │   └── handler/
+│       │       ├── Amqp091FrameDecoder.java
+│       │       ├── Amqp091RequestHandler.java
+│       │       ├── Amqp091ConnectionHandler.java
+│       │       ├── Amqp091ExchangeHandler.java
+│       │       ├── Amqp091QueueHandler.java
+│       │       ├── Amqp091PublishHandler.java
+│       │       ├── Amqp091ConsumeHandler.java
+│       │       ├── Amqp091AckHandler.java
+│       │       ├── Amqp091TxHandler.java
+│       │       ├── Amqp091SessionState.java
+│       │       └── Amqp091ProtocolBundle.java
+│       └── amqp10/                      # AMQP 1.0
+│           ├── Amqp10Codec.java
+│           ├── Amqp10TypeCodec.java
+│           ├── Amqp10MessageCodec.java
+│           ├── Amqp10FrameHeader.java
+│           ├── Amqp10NamespaceStrategy.java
+│           └── handler/
+│               ├── Amqp10FrameDecoder.java
+│               ├── Amqp10RequestHandler.java
+│               ├── Amqp10ConnectionHandler.java
+│               ├── Amqp10SessionHandler.java
+│               ├── Amqp10SenderLinkHandler.java
+│               ├── Amqp10ReceiverLinkHandler.java
+│               ├── Amqp10SessionState.java
+│               └── Amqp10ProtocolBundle.java
+│
+├── ivy-protocol-mqtt/
+│   └── src/main/java/com/ivy/protocol/mqtt/
+│       ├── MqttFraming.java
+│       ├── MqttPacketType.java
+│       ├── MqttVersion.java
+│       ├── MqttQoS.java
+│       ├── MqttConnectCodec.java
+│       ├── MqttPublishCodec.java
+│       ├── MqttSubscribeCodec.java
+│       ├── MqttSimpleCodec.java
+│       ├── Mqtt5PropertiesCodec.java
+│       ├── MqttNamespaceStrategy.java
+│       ├── Mqtt*Data.java               # packet data classes
+│       └── handler/
+│           ├── MqttFrameDecoder.java
+│           ├── MqttRequestHandler.java  # version-dispatches at CONNECT
+│           ├── MqttConnectHandler.java  # shared 3.1.1 + 5.0
+│           ├── MqttPublishHandler.java  # QoS 0/1/2 state machine
+│           ├── MqttSubscribeHandler.java
+│           ├── MqttUnsubscribeHandler.java
+│           ├── MqttPingHandler.java
+│           ├── MqttDisconnectHandler.java
+│           ├── Mqtt5AuthHandler.java    # 5.0 only: AUTH packet
+│           ├── MqttSharedSubHandler.java # 5.0: $share/ → ConsumerGroupCoordinator
+│           ├── MqttRetainedMessageStore.java
+│           ├── MqttTopicMatcher.java
+│           ├── MqttSessionManager.java
+│           ├── MqttSessionState.java
+│           └── MqttProtocolBundle.java
+│
+├── ivy-protocol-postgresql/
+│   └── src/main/java/com/ivy/protocol/pg/
+│       ├── PgWireCodec.java
+│       ├── PgStartupMessage.java
+│       ├── PgWireNamespaceStrategy.java
+│       ├── PgMessage.java               # sealed message types
+│       ├── Pg*Data.java                 # Parse, Bind, Execute data
+│       └── handler/
+│           ├── PgWireFrameDecoder.java
+│           ├── PgWireRequestHandler.java
+│           ├── PgWireStartupHandler.java
+│           ├── PgWireSimpleQueryHandler.java
+│           ├── PgWirePreparedStmtHandler.java
+│           ├── PgWireQueryExecutor.java
+│           ├── SqlQueryParser.java
+│           ├── SqlQuery.java            # sealed
+│           ├── PgWireSessionState.java
+│           └── PgWireProtocolBundle.java
+│
+├── ivy-protocol-mysql/
+│   └── src/main/java/com/ivy/protocol/mysql/
+│       ├── MysqlWireCodec.java
+│       ├── MySqlNamespaceStrategy.java
+│       ├── MySqlColumnDef.java
+│       ├── MysqlAuthResponse.java
+│       └── handler/
+│           ├── MysqlFrameDecoder.java
+│           ├── MysqlRequestHandler.java
+│           ├── MySqlHandshakeHandler.java
+│           ├── MySqlComQueryHandler.java
+│           ├── MySqlComStmtPrepareHandler.java
+│           ├── MySqlComStmtExecuteHandler.java
+│           ├── MySqlQueryExecutor.java
+│           ├── SqlQueryParser.java
+│           ├── MySqlSessionState.java
+│           └── MySqlProtocolBundle.java
+│
+├── ivy-server/
+│   └── src/main/java/com/ivy/server/
+│       ├── BrokerMain.java
+│       ├── NettyBrokerServer.java
+│       ├── NettyPipelineFactory.java
+│       ├── ProtocolDetector.java
+│       ├── TenantResolverHandler.java
+│       ├── ConnectionLimitHandler.java
+│       ├── FlowControlHandler.java
+│       ├── ServerExceptionHandler.java
+│       ├── GracefulShutdown.java
+│       ├── BrokerConfigWatcher.java
+│       └── suspension/
+│           └── SuspensionManager.java
+│
+└── ivy-testing/
+    └── src/main/java/com/ivy/testing/
+        ├── IvyBrokerContainer.java      # Testcontainers singleton
+        ├── ProtocolClientFactory.java   # configured clients for all 7 protocols
+        └── fixtures/                    # common test data builders
 ```
