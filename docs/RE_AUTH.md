@@ -815,6 +815,507 @@ the channel is already closing.
 
 ---
 
+## Security Epoch Registry (Instant Revocation)
+
+> **Related:** [SECURITY.md](SECURITY.md) §Security Epochs
+
+The `CredentialRevocationHandler` (polling `__credentials`) handles reactive revocation but has
+inherent latency (one poll interval). The **Security Epoch Registry** provides a complementary
+sub-microsecond revocation check on every operation.
+
+### Epoch Model
+
+```java
+record SecurityContext(
+    TenantId tenantId,
+    AuthenticatedPrincipal principal,
+    long authEpoch,              // captured at auth time: max(tenantEpoch, principalEpoch)
+    UUID sessionId,              // UUIDv7 per connection
+    String clientIp,
+    ProtocolId protocol
+)
+```
+
+- On authentication (initial or re-auth): `authEpoch = max(tenantEpoch, principalEpoch)`.
+- On credential change: `principalEpoch++` for that `(tenantId, username)`.
+- On ACL change: `principalEpoch++` for the affected principal.
+- On quota change: `principalEpoch++` for the affected principal.
+- On tenant suspend/delete: `tenantEpoch++` for that `TenantId`.
+
+### Per-Operation Check
+
+Before every `BrokerEngine` operation (produce, fetch, subscribe, group join, etc.):
+
+```java
+void checkValid(SecurityContext ctx) {
+    long currentTenantEpoch  = tenantEpochs.get(ctx.tenantId());       // ConcurrentHashMap.get
+    long currentPrincipalEpoch = principalEpochs.get(
+        new TenantUsername(ctx.tenantId(), ctx.principal().name()));    // ConcurrentHashMap.get
+    long currentEpoch = Math.max(currentTenantEpoch, currentPrincipalEpoch);
+    if (ctx.authEpoch() < currentEpoch) {
+        throw new SessionRevokedException(ctx.sessionId());
+    }
+}
+```
+
+**Cost:** ~2–4 ns (two `ConcurrentHashMap.get()` + two `AtomicLong.get()` + one comparison).
+
+### Epoch Propagation (3-Layer Resilience)
+
+| Layer | Mechanism | Latency | Reliability |
+|-------|-----------|---------|-------------|
+| 1 | PG `LISTEN/NOTIFY` on `security_epoch` channel | <100 ms | Best-effort (may miss on PG reconnect) |
+| 2 | Delta sync on PG reconnect | 1–5 ms | Reliable (replays missed epochs) |
+| 3 | Full poll every 60s | 60 s worst-case | Authoritative (catches all misses) |
+
+### PostgreSQL Tables
+
+```sql
+CREATE TABLE tenant_epochs (
+    tenant_id  UUID PRIMARY KEY,
+    epoch      BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE principal_epochs (
+    tenant_id  UUID NOT NULL,
+    username   TEXT NOT NULL,
+    epoch      BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, username)
+);
+```
+
+### Connection Lifecycle After Revocation
+
+1. **Handler level:** catch `SessionRevokedException`, send protocol error, trigger re-auth (Category A)
+   or graceful close (Category C).
+2. **WriteWorker level:** complete all in-flight `CompletableFuture`s with exception (no PG write
+   attempted).
+3. **ReadAccumulator level:** return empty `ReadResult` with error flag.
+4. **Optional force-close:** `ConnectionRegistry.closeByPrincipal(tenantId, username)` for
+   immediate disconnection (used when `failureAction = CLOSE_CONNECTION`).
+
+### Interaction with ReAuthManager
+
+When `checkValid()` throws `SessionRevokedException`:
+
+- **Category A protocols:** transition to `RE_AUTH_REQUIRED` (same as timer-based trigger).
+  The client responds with in-band re-auth. On success, `authEpoch` is refreshed to current.
+- **Category C protocols:** graceful close + reconnect. New connection captures fresh epoch.
+- **Category D protocols:** next request fails with 401/403. Client retries with new credentials.
+
+---
+
+## IP-Level Auth Failure Rate Limiting
+
+Per-connection `MAX_REAUTH_ATTEMPTS` prevents brute-force on a single connection, but an attacker
+can open many connections from the same IP. **IP-level rate limiting** closes this gap.
+
+### Algorithm
+
+```java
+class IpAuthRateLimiter {
+    // Maps client IP → failure state
+    private final ConcurrentHashMap<InetAddress, IpFailureState> perIpState;
+
+    record IpFailureState(
+        AtomicInteger failureCount,
+        AtomicLong lockoutUntil      // epoch millis; 0 = not locked out
+    ) {}
+
+    // Constants
+    static final int FREE_ATTEMPTS = 2;            // no delay for first 2 failures
+    static final int LOCKOUT_THRESHOLD = 5;         // lock out after 5 failures
+    static final long LOCKOUT_DURATION_MS = 300_000; // 5 minutes
+    static final long MAX_DELAY_MS = 10_000;         // cap per-attempt delay
+}
+```
+
+### Progressive Backoff
+
+| Failure # | Delay | Action |
+|-----------|-------|--------|
+| 1–2 | 0 ms | Immediate response (free attempts) |
+| 3 | 1000 ms + jitter [0, 500ms) | Delayed response |
+| 4 | 2000 ms + jitter [0, 500ms) | Delayed response |
+| 5+ | Rejected immediately | 300s lockout; all auth attempts from this IP return error |
+
+**Formula:** `delay = max(0, (failures - FREE_ATTEMPTS) * 1000) + jitter`, capped at `MAX_DELAY_MS`.
+
+### Lockout Behaviour
+
+- Lockout applies to **all** connections from the IP (both initial auth and re-auth).
+- During lockout, auth attempts return `SASL_AUTHENTICATION_FAILED` immediately (no credential lookup).
+- After `LOCKOUT_DURATION_MS` elapses, failure counter resets to 0.
+- Lockout state is in-memory only (lost on restart — acceptable, prevents persistent DoS).
+
+### Timing Side-Channel Prevention
+
+When authentication fails because the **user does not exist**, the broker must still run a
+dummy SCRAM computation (or Argon2id hash) to prevent timing oracle attacks:
+
+```java
+// WRONG — timing reveals user existence
+if (user == null) return AUTH_FAILED;              // fast path: ~1µs
+storedKey = computeScram(password, user.salt());    // slow path: ~5ms
+
+// RIGHT — constant-time regardless of user existence
+byte[] salt = (user != null) ? user.salt() : DUMMY_SALT;
+int iterations = (user != null) ? user.iterations() : DEFAULT_ITERATIONS;
+byte[] computed = computeScram(password, salt, iterations);  // always runs: ~5ms
+if (user == null) return AUTH_FAILED;
+return MessageDigest.isEqual(computed, user.storedKey()) ? AUTH_OK : AUTH_FAILED;
+```
+
+**Rule:** Always use `MessageDigest.isEqual()` (constant-time) for credential comparison.
+Never use `Arrays.equals()` or `==` on credential bytes.
+
+---
+
+## Inter-Broker Re-Auth Context Propagation
+
+> **Related:** [CLUSTERING.md](CLUSTERING.md) §Inter-Broker RPC
+
+When a non-owner broker forwards a write to the partition owner, the security context must travel
+with the request. Without this, the owner broker cannot enforce epochs or revocation.
+
+### InterBrokerSecurityContext
+
+```java
+record InterBrokerSecurityContext(
+    TenantId tenantId,
+    BrokerId sourceBrokerId,
+    UUID incarnationId,           // source broker's incarnation (zombie detection)
+    long leaderEpoch,             // partition epoch at time of forwarding
+    AuthenticatedPrincipal principal,
+    long authEpoch                // client's authEpoch (for epoch revocation check)
+)
+```
+
+### Validation on Receiving Broker
+
+The owner broker validates the forwarded context before processing:
+
+1. **mTLS CN check:** the source broker's TLS client certificate CN must match `sourceBrokerId`.
+2. **Incarnation check:** `incarnationId` must match the source broker's current incarnation in
+   `MetadataImage`. Mismatch → reject (zombie broker).
+3. **Epoch check:** `leaderEpoch` must match or exceed the current epoch for the partition.
+   Stale epoch → `WrongEpochException`.
+4. **Clock skew:** request timestamp must be within 30s of local clock (prevents replay).
+5. **Auth epoch check:** `authEpoch` is checked against the **owner's** epoch registry.
+   If revoked, the forwarded write is rejected and the source broker receives a
+   `SessionRevokedException` which it propagates to the client.
+
+### Wire Format Extension
+
+The `ForwardWriteRequest` RPC message (see [INTERNAL_LOAD_BALANCER.md](INTERNAL_LOAD_BALANCER.md))
+is extended with security context fields:
+
+```
+ForwardWriteRequest:
+  [existing fields: partitionId, batchSize, hopCount, ...]
+  + tenantId:       16 bytes (UUID)
+  + sourceBrokerId: 16 bytes (UUID)
+  + incarnationId:  16 bytes (UUID)
+  + principalName:  2-byte length + UTF-8 bytes
+  + authEpoch:      8 bytes (long)
+  + requestTimestamp: 8 bytes (epoch millis)
+```
+
+---
+
+## Delegation Token Re-Auth Lifecycle
+
+> **Related:** [SECURITY.md](SECURITY.md) §Delegation Tokens
+
+Delegation tokens allow a principal to create a short-lived token that another client can use
+for authentication, without sharing the original credentials.
+
+### Token Structure
+
+```java
+record DelegationToken(
+    TenantId tenantId,
+    String tokenId,              // unique identifier (UUIDv7)
+    String owner,                // principal who created the token
+    String requester,            // principal who requested (may differ from owner)
+    Set<String> renewers,        // principals allowed to renew
+    long issueTimestamp,
+    long maxTimestamp,            // absolute max lifetime (default 7 days)
+    long expiryTimestamp,         // current expiry (renewable up to maxTimestamp)
+    byte[] hmacKey               // HMAC-SHA-256 key (32 bytes, SecureRandom)
+)
+```
+
+### SASL/DELEGATION_TOKEN Authentication
+
+```
+C→S: SaslHandshake(mechanism="DELEGATION_TOKEN")
+S→C: SaslHandshakeResponse(mechanisms=[...])
+C→S: SaslAuthenticate(tokenId + ":" + HMAC-SHA-256(hmacKey, tokenId))
+S→C: SaslAuthenticate(errorCode=0, sessionLifetimeMs=<remaining>)
+```
+
+### Re-Auth with Delegation Tokens
+
+When a delegation token is used for KIP-368 re-auth:
+
+1. Client sends `SaslHandshake(DELEGATION_TOKEN)` on existing connection.
+2. Broker validates: token exists, not expired, HMAC matches, tenant matches.
+3. On success: `sessionLifetimeMs = min(expiryTimestamp - now, maxReauthMs)`.
+4. Principal is set to the token **owner** (not the requester).
+
+### Lifecycle APIs (Kafka Wire)
+
+| API | Key | Description |
+|-----|-----|-------------|
+| `CreateDelegationToken` (38) | — | Create token; returns tokenId + hmacKey |
+| `RenewDelegationToken` (39) | tokenId | Extend expiry (cannot exceed maxTimestamp) |
+| `ExpireDelegationToken` (40) | tokenId | Set expiry to now (immediate invalidation) |
+| `DescribeDelegationToken` (41) | owner filter | List tokens for principal(s) |
+
+### Token Revocation
+
+Expiring/deleting a token increments `principalEpoch` for the token owner, which triggers
+`SessionRevokedException` on all connections authenticated with that token (via Security Epoch
+Registry). The affected connections enter `RE_AUTH_REQUIRED` state.
+
+---
+
+## Audit Events for Re-Auth
+
+> **Related:** [AUDIT_LOGGING.md](AUDIT_LOGGING.md)
+
+Every re-auth attempt (success or failure) emits a structured audit event.
+
+### Event Structure
+
+```json
+{
+  "eventType": "RE_AUTHENTICATE",
+  "timestamp": "2026-03-25T14:32:01.123Z",
+  "tenantId": "550e8400-e29b-41d4-a716-446655440000",
+  "principal": "alice",
+  "newPrincipal": "alice",
+  "clientIp": "10.0.1.42",
+  "protocol": "KAFKA",
+  "mechanism": "OAUTHBEARER",
+  "sessionId": "01913e4b-7c8a-7000-8000-000000000001",
+  "connectionId": "ch-1234",
+  "result": "SUCCESS",
+  "previousAuthEpoch": 41,
+  "newAuthEpoch": 42,
+  "sessionLifetimeMs": 3600000,
+  "reAuthReason": "TOKEN_EXPIRY",
+  "durationMs": 12,
+  "errorCode": null,
+  "errorMessage": null
+}
+```
+
+### Event Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `reAuthReason` | enum | `TOKEN_EXPIRY`, `CREDENTIAL_REVOKED`, `SESSION_LIFETIME`, `TENANT_REVOKED`, `MANUAL` |
+| `result` | enum | `SUCCESS`, `FAILED_CREDENTIAL`, `FAILED_TENANT_MISMATCH`, `FAILED_MECHANISM_MISMATCH`, `FAILED_MAX_ATTEMPTS`, `TIMED_OUT` |
+| `mechanism` | text | `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER`, `DELEGATION_TOKEN`, `PLAIN`, `mTLS` |
+| `durationMs` | long | Time from `RE_AUTH_REQUIRED` → terminal state (latency of re-auth handshake) |
+
+### Masking
+
+Credential fields are **never** included in audit events. The `mechanism` identifies how auth
+was performed; the actual token/password/certificate is not logged (Rule R25).
+
+---
+
+## SASL Mechanism Ordering and Anti-Downgrade
+
+### Mechanism Registry
+
+The broker advertises mechanisms in strength order and enforces anti-downgrade rules:
+
+```java
+enum SaslMechanismStrength {
+    SCRAM_SHA_512(4),    // strongest
+    SCRAM_SHA_256(3),
+    OAUTHBEARER(2),
+    DELEGATION_TOKEN(2),
+    PLAIN(1);            // weakest (TLS required)
+
+    final int strength;
+}
+```
+
+### Ordering Rules
+
+1. `SaslHandshakeResponse.mechanisms` lists mechanisms in descending strength order.
+2. **No downgrade on re-auth:** the mechanism used for re-auth must have strength ≥ the initial
+   auth mechanism. If the client attempts `PLAIN` after initially authenticating with `SCRAM-SHA-512`,
+   the broker rejects with `ILLEGAL_SASL_STATE`.
+3. **`PLAIN` requires TLS:** if the connection is not TLS-encrypted, `PLAIN` is removed from the
+   advertised mechanisms list. Attempting `PLAIN` without TLS → `UNSUPPORTED_SASL_MECHANISM`.
+4. **Mechanism immutability for MQTT 5.0:** the `authMethod` in `AUTH` packets must match
+   the `authMethod` in the original `CONNECT`. Changing mechanism is not allowed.
+
+---
+
+## Quota Re-Evaluation on Re-Auth
+
+When re-auth succeeds and the principal changes (e.g., different service account within same tenant),
+quota buckets must be re-evaluated.
+
+### Quota Transition Flow
+
+```
+Re-auth success (principal A → principal B, same tenant):
+  1. ACL cache invalidated (existing Rule R28)
+  2. Quota bucket for principal A: decrement connection count
+  3. Quota bucket for principal B: increment connection count
+  4. Rate limiter re-bound:
+     - old: TokenBucket keyed by (tenantId, "A", clientId, quotaType)
+     - new: TokenBucket keyed by (tenantId, "B", clientId, quotaType)
+  5. Connection quota checked: if principal B exceeds max connections → RE_AUTH_FAILED
+```
+
+### Same-Principal Re-Auth
+
+When the principal does NOT change (most common case — same user refreshing JWT):
+
+1. ACL cache invalidated (R28).
+2. Quota config re-read (in case admin changed quota limits).
+3. Rate limiter tokens NOT reset (prevents abuse: re-auth to refill quota).
+4. Connection count unchanged.
+
+---
+
+## Cross-Protocol ACL Invalidation on Re-Auth
+
+> **Related:** [ACL_DESIGN.md](ACL_DESIGN.md) §Protocol-Scoped ACLs
+
+When a Kafka producer re-auths and its ACLs change, other protocols may be affected if the
+same principal has cross-protocol sessions.
+
+### Invalidation Scope
+
+ACL cache invalidation on re-auth is scoped to the **principal across all protocols**, not just
+the re-authenticating connection's protocol:
+
+```java
+// On successful re-auth:
+aclAuthorizer.invalidateByPrincipal(tenantId, principal);
+// This clears Caffeine cache entries for ALL protocol combinations:
+//   (tenantId, principal, KAFKA, *)
+//   (tenantId, principal, MQTT, *)
+//   (tenantId, principal, AMQP, *)
+//   etc.
+```
+
+### Why Cross-Protocol Invalidation
+
+An admin may revoke a principal's MQTT SUBSCRIBE permission while the principal is re-authing
+on a Kafka connection. Without cross-protocol invalidation, the stale MQTT ACL cache entry
+would persist until its TTL expires (up to 5 minutes).
+
+### Push Notification to Other Connections
+
+Beyond cache invalidation, the `CredentialRevocationHandler` can push re-auth triggers to
+**all connections** for the affected principal (not just the one that re-authenticated):
+
+```java
+// After successful re-auth that changed ACLs:
+if (aclsChanged) {
+    credentialRevocationHandler.triggerReAuthForPrincipal(tenantId, principal);
+    // Sends RE_AUTH_REQUIRED to all other connections for this principal
+}
+```
+
+This ensures MQTT subscribers and AMQP consumers pick up permission changes promptly.
+
+---
+
+## CRL/OCSP Certificate Revocation Checking (Category E Extension)
+
+> **Related:** [CERT_MANAGEMENT.md](CERT_MANAGEMENT.md)
+
+Category E covers certificate expiry, but a certificate may be **revoked** before expiry
+(compromised private key, employee departure, etc.).
+
+### CRL (Certificate Revocation List) Checking
+
+```java
+record CrlConfig(
+    boolean enabled,                   // default: false
+    Duration refreshInterval,          // default: 1 hour
+    Duration cacheMaxAge,              // default: 24 hours
+    CrlFailurePolicy failurePolicy     // SOFT_FAIL or HARD_FAIL
+)
+```
+
+**SOFT_FAIL (default):** If the CRL cannot be fetched (network error, timeout), the certificate
+is **accepted**. This prevents a CRL distribution point outage from causing a total auth failure.
+
+**HARD_FAIL:** If the CRL cannot be fetched, the certificate is **rejected**. Use when
+security requirements outweigh availability (e.g., financial services).
+
+### OCSP Stapling
+
+```java
+record OcspConfig(
+    boolean enabled,                   // default: false
+    boolean staplingRequired,          // default: false (if true, reject if no staple)
+    Duration responseMaxAge,           // default: 24 hours
+    OcspFailurePolicy failurePolicy    // SOFT_FAIL or HARD_FAIL
+)
+```
+
+OCSP stapling allows the TLS server to include a pre-fetched OCSP response in the TLS handshake,
+eliminating the client's need to contact the OCSP responder directly. Configured per-tenant
+in `TlsTenantConfig`.
+
+### Integration with Re-Auth
+
+For mTLS Category E connections, CRL/OCSP checks occur:
+1. At initial TLS handshake (connection establishment).
+2. On CRL refresh (background thread checks if any connected cert's serial appears in new CRL).
+3. If a connected certificate is found in a CRL update → immediate graceful close (same as
+   Category C signals).
+
+---
+
+## `DRAIN` Failure Action
+
+In addition to `CLOSE_CONNECTION` and `CONTINUE_READ_ONLY`, a third failure action is available:
+
+### Configuration
+
+```yaml
+broker:
+  reauth:
+    failureAction: DRAIN    # CLOSE_CONNECTION | CONTINUE_READ_ONLY | DRAIN
+    drainTimeoutMs: 30000   # max time for DRAIN before forced close (default: 30s)
+```
+
+### Behaviour
+
+When `failureAction = DRAIN` and re-auth fails:
+
+1. The connection enters `DRAINING` state (new sub-state of `RE_AUTH_FAILED`).
+2. **No new requests accepted** — any new Produce/Fetch/Subscribe returns `RE_AUTHENTICATION_REQUIRED`.
+3. **In-flight requests complete normally** — outstanding PG transactions, pending fetches, and
+   consumer group commits finish.
+4. **Push deliveries stop** — no new messages pushed to MQTT/AMQP subscribers.
+5. After all in-flight work completes (or `drainTimeoutMs` elapses), the connection is closed.
+
+### Use Case
+
+`DRAIN` is useful for exactly-once producers where an abrupt close could leave a transaction
+in `ONGOING` state (requiring timeout-based abort). The drain period allows the producer to
+complete its current transaction before the connection is severed.
+
+---
+
 ## Known Limitations
 
 | # | Limitation | Impact | Status |
@@ -901,6 +1402,11 @@ creating a thundering herd against the credential store. 5s jitter spreads the l
 | `KafkaReAuthHandlerTest` | KIP-368 wire format | Mechanism mismatch, tenant mismatch, SCRAM 4-message exchange, OAUTHBEARER single-round, `sessionLifetimeMs` computation |
 | `MqttReAuthHandlerTest` | AUTH packet | MQTT 5.0 only (3.1.1 rejected), authMethod immutability, reason codes |
 | `CategoryBCReAuthTest` | MySQL/Redis/graceful-close | COM_CHANGE_USER session reset, Redis pub/sub AUTH blocked in RESP2, NATS error string, STOMP ERROR frame |
+| `SecurityEpochTest` | Epoch revocation | Credential change → epoch increment → next operation rejected, tenant suspend → all operations rejected, epoch propagation via LISTEN/NOTIFY |
+| `IpRateLimiterTest` | IP-level auth rate limiting | Progressive backoff timing, lockout at 5 failures, lockout expiry after 300s, timing side-channel (constant-time on unknown user) |
+| `MechanismOrderingTest` | Anti-downgrade | Downgrade attempt rejected, PLAIN without TLS rejected, MQTT authMethod immutability |
+| `DelegationTokenReAuthTest` | Token re-auth | Token used for KIP-368 re-auth, expired token rejected, revoked token triggers epoch |
+| `QuotaReEvaluationTest` | Quota on principal change | Principal change → new quota bucket, same principal → config re-read, connection quota checked |
 
 ### Integration Tests
 
@@ -912,6 +1418,11 @@ creating a thundering herd against the credential store. 5s jitter spreads the l
 | `CredentialRevokeIT` | Admin revokes credential; all matching connections closed within 5s |
 | `TenantMismatchIT` | Re-auth with credential for wrong tenant → connection closed, error logged |
 | `MaxAttemptsIT` | 4 consecutive wrong credentials → `RE_AUTH_FAILED` after 3rd, connection closed |
+| `SecurityEpochIT` | Credential revocation via epoch → active producer gets SessionRevokedException within 100ms |
+| `InterBrokerReAuthIT` | Forwarded write with revoked authEpoch rejected by owner broker |
+| `DelegationTokenLifecycleIT` | Create → authenticate → renew → expire → re-auth fails |
+| `CrossProtocolAclIT` | Kafka re-auth with ACL change → MQTT subscriber ACL cache invalidated |
+| `IpLockoutIT` | 5 failed auths from same IP → 300s lockout → all new connections from IP rejected |
 
 ### E2E Tests
 
@@ -920,8 +1431,12 @@ creating a thundering herd against the credential store. 5s jitter spreads the l
 | `LongRunningProducerE2E` | Kafka producer runs for 3+ hours with hourly JWT rotation; zero dropped messages |
 | `CredentialRotationE2E` | SCRAM password rotated during active produce; grace period allows seamless transition |
 | `CategoryCReconnectE2E` | AMQP client reconnects after graceful close; consumer group rejoins cleanly |
+| `EpochRevocationE2E` | Admin deletes user → epoch increments → all connections for that user close within 200ms across cluster |
+| `DrainFailureActionE2E` | Re-auth fails with `DRAIN` action → in-flight transaction completes → connection closes cleanly |
 
 ---
 
 *Last updated: 2026-03-25*
-*See also: [MULTI_TENANT.md](MULTI_TENANT.md) §TenantContext, [RULES.md](RULES.md) §R27–R28*
+*See also: [MULTI_TENANT.md](MULTI_TENANT.md) §TenantContext, [RULES.md](RULES.md) §R27–R36,
+[SECURITY.md](SECURITY.md), [ACL_DESIGN.md](ACL_DESIGN.md), [AUDIT_LOGGING.md](AUDIT_LOGGING.md),
+[CERT_MANAGEMENT.md](CERT_MANAGEMENT.md)*

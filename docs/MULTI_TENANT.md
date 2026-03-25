@@ -581,11 +581,55 @@ from protocol handlers. Auth enforcement happens in handlers before calling `Bro
 
 ---
 
+## Per-Protocol Internal Topics
+
+Each protocol maintains its own metadata in dedicated internal topics, all tenant-scoped:
+
+| Topic | Protocol | Key Format | Value |
+|-------|----------|-----------|-------|
+| `__kafka_producer_states` | Kafka | `tenantId:producerId:partitionId` | Producer epoch, sequence |
+| `__kafka_groups` | Kafka | `tenantId:groupId` | Consumer group state, generation |
+| `__mqtt_retained` | MQTT | `tenantId:topicFilter` | Retained message payload |
+| `__mqtt_sessions` | MQTT | `tenantId:clientId` | Session state, subscriptions |
+| `__amqp_exchanges` | AMQP 0-9-1 | `tenantId:exchangeName` | Exchange type, bindings |
+| `__amqp_queues` | AMQP 0-9-1 | `tenantId:queueName` | Queue config, bindings |
+
+**Isolation property:** Protocol-specific topics are scoped to their protocol. Kafka consumer
+groups (`__kafka_groups`) are invisible to MQTT clients and vice versa. Cross-protocol metadata
+sharing only occurs through the shared message partitions.
+
+---
+
+## Entity Hierarchy (Future: Brand > Tenant > Project > User)
+
+The current design uses a flat `Tenant → User` model. The architecture supports extending to a
+4-level hierarchy with **ceiling constraints** in a future phase:
+
+```
+Brand (e.g., "Conduktor" — white-label boundary)
+  ├── Global quotas, feature flags, branding config
+  └── Tenant (UUID, SNI hostname, status)
+       ├── Quotas, feature flags (ceiling: brand limits)
+       └── Project (e.g., "payments", "analytics")
+            ├── Destinations (topics) scoped to project
+            └── User (e.g., "alice") with per-project overrides
+                 └── Quotas, ACLs (ceiling: tenant limits)
+```
+
+**Ceiling constraint:** A child level can never exceed its parent's limits.
+Example: Brand sets `max_connections = 10000`. Tenant cannot set `max_connections = 20000`.
+
+This hierarchy is not yet implemented but the `TenantConfig` JSONB structure is extensible
+to accommodate it without schema changes.
+
+---
+
 ## Invariants (from RULES.md)
 
 - **R5:** TenantId present in all `BrokerEngine` and `StorageEngine` method signatures
 - **R6:** SQL defense-in-depth — `WHERE partition_id = ? AND tenant_id = ?` always
 - **R7:** `SecurityContext` is never null — use `SecurityContext.ANONYMOUS` for pre-auth
 - **R17:** DLQ topics are `__dlq.<original-topic>` — always tenant-scoped via partition UUID
+- **R33:** Security epoch check before every `BrokerEngine` operation
 - No `System.currentTimeMillis()` in tenant lifecycle code — use `Environment.clock()`
 - Internal topic keys always prefixed with `tenantId + ":"` — no bare topic names

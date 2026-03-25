@@ -535,3 +535,47 @@ storage:
     cleaner-interval-ms: 60000      # SegmentCleaner cycle
     deletion-delay-ms: 30000        # wait after EXPIRED before DELETED
 ```
+
+---
+
+## Pluggable Storage Engine SPI (Future)
+
+The current implementation uses PostgreSQL as the sole permanent storage engine.
+The architecture supports a pluggable `PermanentStorageEngine` SPI for future extensibility:
+
+```java
+sealed interface PermanentStorageEngine {
+    void writeBatch(PartitionId partitionId, List<MessageRecord> records);
+    List<MessageRecord> fetchRange(PartitionId partitionId, long startOffset, int maxRecords);
+    long highWatermark(PartitionId partitionId);
+}
+```
+
+### Planned Storage Backends
+
+| Backend | Latency | Use Case | Status |
+|---------|---------|----------|--------|
+| **PostgreSQL** (current) | ~2–5 ms | SQL-queryable, ACID, replication via Patroni/RDS | Implemented |
+| **Standalone** (fsync-only) | ~0 ms | Single-node, dev/test, no external dependency | Designed |
+| **Kafka** | ~5 ms | Fan-out to upstream Kafka cluster, multi-DC | Designed |
+| **FoundationDB** | ~10 ms | Ordered KV, deterministic, multi-region | Designed |
+| **S3 + Iceberg** | ~100 ms | Cost-optimized cold storage, analytics via Trino/Athena | Designed |
+
+### Standalone Mode
+
+When no external storage is configured, segments with `fsync=on` are the sole durability layer.
+ACK fires after `FileChannel.force(true)` instead of PG COMMIT. This eliminates the PG
+dependency entirely but loses SQL queryability and cross-broker data sharing.
+
+### Storage Engine Selection
+
+```yaml
+storage:
+  engine: postgresql           # postgresql | standalone | kafka | foundationdb | s3-iceberg
+  postgresql:
+    jdbc-url: jdbc:postgresql://localhost:5432/ivy
+    # ... (current config)
+```
+
+Only one engine is active per broker. Changing engines requires data migration (export/import
+via segment replay).

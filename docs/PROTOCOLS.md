@@ -1077,3 +1077,51 @@ HttpServerCodec → HttpObjectAggregator(10MB) → HttpRequestDispatcher
 
 Health/metrics remain on port 8080 (`GET /health`, `GET /ready`, `GET /metrics`).
 
+---
+
+## Protocol Extensibility (ProtocolBundle SPI)
+
+Ivy's architecture supports adding new protocols via the `ProtocolBundle` SPI. Adding a
+protocol changes **only the protocol module** — zero changes to `ivy-broker`, `ivy-auth`,
+`ivy-storage`, or `ivy-server`.
+
+### Currently Supported (8 Protocols)
+
+| ID | Protocol | Port | Module |
+|----|----------|------|--------|
+| 1 | Kafka | 9092/9093 | `ivy-protocol-kafka` |
+| 2 | AMQP 0-9-1 | 5672/5671 | `ivy-protocol-amqp` |
+| 3 | AMQP 1.0 | 5673/5674 | `ivy-protocol-amqp` |
+| 4 | MQTT 3.1.1 | 1883/8883 | `ivy-protocol-mqtt` |
+| 5 | MQTT 5.0 | 1884/8884 | `ivy-protocol-mqtt` |
+| 6 | MySQL Wire | 3306/3307 | `ivy-protocol-mysql` |
+| 7 | PgWire | 5432/5433 | `ivy-protocol-postgresql` |
+| 8 | HTTP REST | 8081/8443 | `ivy-protocol-http` |
+
+### Future Protocol Candidates (Designed in Sibling Repos)
+
+| Protocol | Wire Format | Auth Mechanism | Re-Auth Category |
+|----------|-------------|---------------|-----------------|
+| NATS | Text (ASCII) | CONNECT auth_required | C (reconnect) |
+| STOMP 1.2 | Text (frame-based) | CONNECT login/passcode | C (reconnect) |
+| OpenWire | Binary (JMS) | SASL | C (reconnect) |
+| Redis Streams | RESP protocol | AUTH command | B (command) |
+| Pulsar | Binary (protobuf) | CommandAuthChallenge | A (native in-band) |
+| RabbitMQ Streams | Binary (proprietary) | SASL | A (native in-band) |
+| AWS Kinesis | HTTP REST (SigV4) | AWS SigV4 | D (stateless) |
+| AWS SQS/SNS | HTTP REST (SigV4) | AWS SigV4 | D (stateless) |
+| Google Pub/Sub | gRPC (OAuth2) | Bearer token | D (stateless) |
+| S3-Compatible | HTTP REST (SigV4) | AWS SigV4 HMAC-SHA256 | D (stateless) |
+
+Protocol IDs are **append-only** (Rule R4). New protocols receive the next available ID.
+IDs are stored in `messages.protocol_id` and segment trailers — reassigning or reordering
+would corrupt existing data.
+
+### Adding a New Protocol
+
+1. Create `ivy-protocol-{name}/` module with `ProtocolBundle` implementation.
+2. Register via `META-INF/services/com.ivy.common.spi.ProtocolBundle` (ServiceLoader).
+3. Implement `ByteBufCodec` (wire decode/encode) and handler classes.
+4. Map protocol-native concepts to Ivy's `BrokerEngine` API.
+5. No changes to other modules required.
+

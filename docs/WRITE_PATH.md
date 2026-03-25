@@ -474,3 +474,60 @@ zero-copy streaming into PG (no intermediate buffering in the JVM).
 Throughput is bounded by PG transaction throughput (~2K TPS per PG core), not network.
 Batching amortises transaction overhead across messages, which is why batch size
 dominates the throughput number above everything else.
+
+---
+
+## Transformation Pipeline (Pre-Write)
+
+Before messages enter the `WriteAccumulator`, an optional transformation pipeline runs.
+Transformations may change the message key, value, or headers — and since the key determines
+the partition, **transformation MUST happen BEFORE partition resolution**.
+
+```
+Protocol Handler (decode wire → RawMessage)
+    ↓
+TransformationPipeline (optional, per-tenant config)
+    ↓ (may change key → changes partition assignment)
+PartitionRouter (key hash → partition selection)
+    ↓
+HRWRouter (partition → owner broker)
+    ↓
+WriteAccumulator (standard write path)
+```
+
+### Transform Stages (Executed In Order)
+
+| Stage | Description | May Change Key? |
+|-------|-------------|-----------------|
+| **Schema Validation** | Validate against registered Avro/JSON/Protobuf schema | No |
+| **Data Masking** | Mask PII fields (e.g., `email` → `***@***.com`) | No |
+| **Field-Level Encryption** | Encrypt sensitive fields with tenant KMS key | No |
+| **JSONata Transform** | Apply JSONata expression to restructure payload | **Yes** |
+| **Header Injection** | Add metadata headers (source protocol, timestamp, tracing) | No |
+
+### Payload Abstraction (Dual-View)
+
+Messages may arrive as binary (Kafka, MQTT) or JSON (HTTP, PgWire). The transformation
+pipeline operates on a unified `Payload` interface:
+
+```java
+sealed interface Payload {
+    byte[] asBytes();       // for wire encoding (Kafka, MQTT)
+    JsonNode asJson();      // for transformation, masking, encryption
+    int sizeBytes();        // for quota accounting
+}
+
+record BinaryPayload(byte[] data) implements Payload {
+    // asJson() parses on first access (lazy)
+}
+
+record JsonPayload(JsonNode node) implements Payload {
+    // asBytes() serializes on first access (lazy)
+}
+```
+
+### Critical Ordering Invariant
+
+**Transform BEFORE Resolve.** If a JSONata transform changes the message key, the partition
+assignment must reflect the **transformed** key, not the original. Reversing this order would
+route messages to the wrong partition.

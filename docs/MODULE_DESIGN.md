@@ -741,9 +741,35 @@ autoresearch-v8/
 │       └── suspension/
 │           └── SuspensionManager.java
 │
-└── ivy-testing/
-    └── src/main/java/com/ivy/testing/
-        ├── IvyBrokerContainer.java      # Testcontainers singleton
-        ├── ProtocolClientFactory.java   # configured clients for all 7 protocols
-        └── fixtures/                    # common test data builders
+├── ivy-testing/
+│   └── src/main/java/com/ivy/testing/
+│       ├── IvyBrokerContainer.java      # Testcontainers singleton
+│       ├── ProtocolClientFactory.java   # configured clients for all 7 protocols
+│       └── fixtures/                    # common test data builders
+│
+├── ivy-lint/
+│   └── src/main/java/com/ivy/lint/
+│       ├── TenantSqlIsolationRule.java  # compile-time: SQL must include tenant_id
+│       ├── SealedSwitchExhaustivenessRule.java  # no default on sealed switch
+│       ├── NullReturnRule.java          # no null returns from public methods
+│       ├── RawPrimitiveRule.java        # no raw UUID/long in public signatures
+│       └── EnvironmentUsageRule.java    # no direct System.currentTimeMillis()
+│
+└── ivy-schema/
+    └── src/main/java/com/ivy/schema/
+        ├── SchemaRegistry.java          # Confluent SR REST v1 compatible
+        ├── AvroSchemaParser.java
+        ├── JsonSchemaParser.java
+        ├── ProtobufSchemaParser.java
+        ├── CompatibilityValidator.java  # BACKWARD, FORWARD, FULL, NONE
+        └── SchemaProtocolBundle.java    # ServiceLoader registration
 ```
+
+---
+
+## Future Modules (Designed, Not Yet Implemented)
+
+| Module | Purpose | Status |
+|--------|---------|--------|
+| `ivy-lake` | S3-compatible chunk storage (8MB fixed chunks, FileChannel I/O) for object storage protocol | Designed |
+| `ivy-codegraph` | Bytecode-level dependency analysis for selective test execution and lint | Designed |

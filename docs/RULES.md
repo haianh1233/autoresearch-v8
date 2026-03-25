@@ -213,3 +213,35 @@ a request after expiry receive a `RE_AUTHENTICATION_REQUIRED` error.
 `HttpRequestHandler` evaluates credentials on every request. There is no `ReAuthManager`
 instance for HTTP connections. Token expiry returns `401 Unauthorized`; the client
 obtains a new token and retries the request.
+
+**R31. Constant-time credential comparison.**
+All credential comparisons must use `MessageDigest.isEqual()` (constant-time).
+Never use `Arrays.equals()`, `String.equals()`, or `==` on credential bytes.
+This prevents timing side-channel attacks that reveal partial credential matches.
+
+**R32. Timing side-channel prevention on unknown users.**
+When authentication fails because the user does not exist, the broker must still run
+the full SCRAM/Argon2id computation with a dummy salt. This prevents timing oracle
+attacks that reveal whether a username exists. The dummy computation must take
+approximately the same time as a real credential verification.
+
+**R33. Security epoch check before every BrokerEngine operation.**
+Every call to `BrokerEngine.write()`, `BrokerEngine.read()`, `BrokerEngine.subscribe()`,
+and `BrokerEngine.joinGroup()` must call `SecurityEpochRegistry.checkValid(ctx)`.
+If `ctx.authEpoch < currentEpoch`, throw `SessionRevokedException` immediately.
+Cost: ~2–4 ns (two ConcurrentHashMap lookups + comparison). See RE_AUTH.md §Security Epoch Registry.
+
+**R34. Per-IP auth failure lockout.**
+After 5 authentication failures from the same IP address within a sliding window,
+all auth attempts from that IP are rejected for 300 seconds. Lockout is in-memory
+only (lost on restart). See RE_AUTH.md §IP-Level Auth Failure Rate Limiting.
+
+**R35. Credentials are never stored in plaintext.**
+Only SCRAM `StoredKey` and `ServerKey` are persisted (plus salt and iterations).
+Plaintext passwords and `ClientKey` are never written to any store (PG, segment,
+log, metric, or audit event). See SECURITY.md §Credential Storage.
+
+**R36. SASL mechanism anti-downgrade on re-auth.**
+The mechanism used for re-auth must have strength ≥ the initial auth mechanism.
+Attempting a weaker mechanism (e.g., PLAIN after SCRAM-SHA-512) results in
+`ILLEGAL_SASL_STATE` error and connection close. See RE_AUTH.md §SASL Mechanism Ordering.

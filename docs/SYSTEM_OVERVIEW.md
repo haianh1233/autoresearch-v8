@@ -198,14 +198,20 @@ Consumer nacks / TTL expires / max-retries exceeded
 | Clustering (HRW, heartbeat, fencing) | [CLUSTERING.md](CLUSTERING.md) |
 | Multi-tenancy (SNI, TenantId, ACLs) | [MULTI_TENANT.md](MULTI_TENANT.md) |
 | Transactions (exactly-once, 2PC) | [TRANSACTIONS.md](TRANSACTIONS.md) |
-| **Shutdown & crash recovery** | **[SHUTDOWN_AND_RECOVERY.md](SHUTDOWN_AND_RECOVERY.md)** |
-| Re-authentication | [RE_AUTH.md](RE_AUTH.md) |
+| Shutdown & crash recovery | [SHUTDOWN_AND_RECOVERY.md](SHUTDOWN_AND_RECOVERY.md) |
+| Security architecture (8-layer pipeline) | [SECURITY.md](SECURITY.md) |
+| Re-authentication (5 categories, epochs) | [RE_AUTH.md](RE_AUTH.md) |
+| ACL design (DENY-first, protocol-scoped) | [ACL_DESIGN.md](ACL_DESIGN.md) |
+| Audit logging (structured events) | [AUDIT_LOGGING.md](AUDIT_LOGGING.md) |
+| Certificate management (TLS, CRL/OCSP) | [CERT_MANAGEMENT.md](CERT_MANAGEMENT.md) |
+| Threat model (personas, attack vectors) | [THREAT_MODEL.md](THREAT_MODEL.md) |
+| Configuration system (6-level cascade) | [CONFIG_SYSTEM.md](CONFIG_SYSTEM.md) |
 | PostgreSQL schema | [POSTGRES_SCHEMA.md](POSTGRES_SCHEMA.md) |
 | Protocol details | [PROTOCOLS.md](PROTOCOLS.md) |
 | Dead letter queues | [DEAD_LETTER_QUEUE.md](DEAD_LETTER_QUEUE.md) |
 | Internal load balancer | [INTERNAL_LOAD_BALANCER.md](INTERNAL_LOAD_BALANCER.md) |
 | Module structure | [MODULE_DESIGN.md](MODULE_DESIGN.md) |
-| Implementation rules | [RULES.md](RULES.md) |
+| Implementation rules (R1–R36) | [RULES.md](RULES.md) |
 | Implementation phases | [IMPLEMENTATION_PHASES.md](IMPLEMENTATION_PHASES.md) |
 
 ---

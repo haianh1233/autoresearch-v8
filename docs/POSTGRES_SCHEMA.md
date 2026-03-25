@@ -323,6 +323,97 @@ CREATE INDEX idx_acl_entries_lookup ON acl_entries(tenant_id, principal, resourc
 
 ---
 
+### tenant_epochs
+Security epoch persistence for instant credential revocation. See [RE_AUTH.md](RE_AUTH.md) §Security Epoch Registry.
+
+```sql
+CREATE TABLE tenant_epochs (
+    tenant_id  UUID        PRIMARY KEY,
+    epoch      BIGINT      NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+**Notes:**
+- Incremented on tenant suspend/delete.
+- Propagated to all brokers via PG `LISTEN/NOTIFY` on `security_epoch` channel.
+- Checked before every `BrokerEngine` operation (~2–4 ns, Rule R33).
+
+---
+
+### principal_epochs
+Per-principal security epoch for credential/ACL/quota changes.
+
+```sql
+CREATE TABLE principal_epochs (
+    tenant_id  UUID        NOT NULL,
+    username   TEXT        NOT NULL,
+    epoch      BIGINT      NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, username)
+);
+```
+
+**Notes:**
+- Incremented on: credential change, ACL change, quota change, delegation token revocation.
+- Combined with `tenant_epochs` for the per-operation epoch check:
+  `authEpoch = max(tenantEpoch, principalEpoch)`.
+
+---
+
+### audit_log
+Structured audit events for security operations. See [AUDIT_LOGGING.md](AUDIT_LOGGING.md).
+
+```sql
+CREATE TABLE audit_log (
+    event_id    UUID        NOT NULL DEFAULT gen_random_uuid(),
+    tenant_id   UUID        NOT NULL,
+    event_type  TEXT        NOT NULL,
+    timestamp   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    principal   TEXT,
+    client_ip   INET,
+    protocol    TEXT,
+    session_id  UUID,
+    broker_id   UUID,
+    result      TEXT,
+    details     JSONB       NOT NULL DEFAULT '{}',
+    PRIMARY KEY (timestamp, event_id)
+) PARTITION BY RANGE (timestamp);
+
+CREATE INDEX idx_audit_tenant_time ON audit_log (tenant_id, timestamp DESC);
+CREATE INDEX idx_audit_principal   ON audit_log (tenant_id, principal, timestamp DESC);
+CREATE INDEX idx_audit_event_type  ON audit_log (event_type, timestamp DESC);
+```
+
+**Notes:**
+- Partitioned by month (auto-created by `AuditPartitionManager`).
+- Retention tiers: hot (30d, full indexes), warm (365d, read-only tablespace), cold (S3 export).
+- Append-only: broker PG user has no UPDATE/DELETE permission on this table.
+- Written via dedicated PG connection (not from HikariCP pool).
+
+---
+
+### metadata_kv
+Key-value store for delta sync of metadata (epochs, config versions, etc.).
+
+```sql
+CREATE TABLE metadata_kv (
+    key        TEXT        PRIMARY KEY,
+    value      BYTEA       NOT NULL,
+    version    BIGINT      NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_metadata_kv_version ON metadata_kv(version);
+```
+
+**Notes:**
+- Used for security epoch delta sync on broker reconnect.
+- `version` is monotonically increasing; brokers request changes since their last known version.
+- Small table (~100s of rows); no partitioning needed.
+
+---
+
 ## Internal Topics (Compacted Metadata)
 
 These topics use `cleanup_policy = 'compact'` — only the latest value per key is retained.
@@ -357,7 +448,36 @@ another tenant's committed offsets. This is enforced by `TenantSqlIsolation` at 
 
 ---
 
-## Connection Pool Configuration (HikariCP)
+## Connection Pool Configuration
+
+Ivy uses **separated connection pools** to prevent read bursts from starving writes during
+failover or load spikes.
+
+### Write Pool (Dedicated, Thread-Affine)
+
+4 dedicated connections obtained via `DriverManager` (not HikariCP). One per `WriteWorker`
+platform thread, held for the lifetime of the thread via `ThreadLocal<Connection>`.
+
+```
+WriteWorker[0] → Connection A (affinity: Murmur2(partitionId) % 4 == 0)
+WriteWorker[1] → Connection B (affinity: Murmur2(partitionId) % 4 == 1)
+WriteWorker[2] → Connection C (affinity: Murmur2(partitionId) % 4 == 2)
+WriteWorker[3] → Connection D (affinity: Murmur2(partitionId) % 4 == 3)
+```
+
+No connection pool overhead, no checkout contention. Rule R11a ensures these are platform threads.
+
+### StorageFlusher Connection (Dedicated)
+
+1 dedicated connection for the `StorageFlusher` thread. Used for binary COPY of sealed segments
+to PG. Separate from write pool to prevent flusher from blocking writes.
+
+### Audit Connection (Dedicated)
+
+1 dedicated connection for `AuditWriter`. Separate from all other pools to prevent audit
+logging from interfering with message operations.
+
+### Read/Metadata Pool (HikariCP)
 
 ```yaml
 storage:
@@ -365,11 +485,24 @@ storage:
     jdbc-url: jdbc:postgresql://localhost:5432/ivy
     username: ivy
     password: ${IVY_PG_PASSWORD}
-    pool:
-      maximum-pool-size: 20      # max connections per broker
+    read-pool:
+      maximum-pool-size: 14       # reads, metadata queries, health checks
       minimum-idle: 5
       connection-timeout-ms: 3000
       idle-timeout-ms: 600000
       max-lifetime-ms: 1800000
       keepalive-time-ms: 30000
+```
+
+### Total Connections Per Broker
+
+```
+4  WriteWorker (dedicated, thread-affine)
+1  StorageFlusher (dedicated)
+1  AuditWriter (dedicated)
+14 Read/Metadata pool (HikariCP)
+──
+20 total connections per broker
+
+For N brokers: PG max_connections >= N * 20 + headroom
 ```
