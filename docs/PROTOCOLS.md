@@ -2,7 +2,7 @@
 
 ## Overview
 
-All five protocols share the same underlying broker engine, storage, and clustering.
+All seven protocols share the same underlying broker engine, storage, and clustering.
 They differ only in wire encoding and protocol-specific semantics.
 
 ```
@@ -23,10 +23,12 @@ Protocol Wire Format → Protocol Handler → BrokerEngine (shared)
 | ID | Protocol | Notes |
 |----|----------|-------|
 | 1  | Kafka | Primary protocol |
-| 2  | AMQP 0-9-1 | Exchange/queue model |
-| 3  | MQTT 3.1.1 | Pub/sub, IoT |
-| 4  | MySQL wire | Read-only SQL view |
-| 5  | PgWire | Read-only SQL view |
+| 2  | AMQP 0-9-1 | Exchange/queue model, classic RabbitMQ wire |
+| 3  | AMQP 1.0 | ISO standard, Azure Service Bus / ActiveMQ Artemis wire |
+| 4  | MQTT 3.1.1 | Pub/sub, IoT, most widely deployed MQTT version |
+| 5  | MQTT 5.0 | Enhanced MQTT: user properties, shared subscriptions, reason codes |
+| 6  | MySQL wire | Read-only SQL view |
+| 7  | PgWire | Read-only SQL view |
 
 Protocol IDs are stored in the `messages.protocol_id` column and segment trailers.
 They are **append-only** — never reuse or reorder an ID.
@@ -38,15 +40,20 @@ They are **append-only** — never reuse or reorder an ID.
 `ProtocolDetector` peeks at the first 4 bytes without consuming them:
 
 ```
-Bytes 0-3          → Protocol
-─────────────────────────────────────────────────────────
-0x00 0x?? ...      → Kafka (MSB-first 4-byte request length, starts near 0)
-0x10 - 0xF0        → MQTT  (first byte = control packet type; CONNECT = 0x10)
-0x41 0x4D 0x51 0x50 → AMQP  ("AMQP" ASCII magic)
-<len:3><seq:1>0x0A → MySQL (handshake packet, length-prefixed, type=0x0A for server greeting)
-                            Note: detect by 4-byte frame with byte[4]=0x0A
-0x00 0x00 0x00 ??  → PgWire (first 4 bytes = message length, next 4 = 196608 = protocol 3.0)
-                            Disambiguate from Kafka: byte[4..7] = 0x00 0x03 0x00 0x00
+Bytes 0-3               → Protocol
+──────────────────────────────────────────────────────────────────────────────
+0x00 0x?? ...           → Kafka  (MSB-first 4-byte request length, starts near 0)
+0x10 - 0xEF             → MQTT 3.1.1  (first byte = control packet type; CONNECT = 0x10)
+                                       Note: MQTT 5.0 also starts with 0x10 (CONNECT)
+                                       → version detected inside CONNECT payload (byte[9])
+                                         0x04 = MQTT 3.1.1, 0x05 = MQTT 5.0
+0x41 0x4D 0x51 0x50     → AMQP  ("AMQP" ASCII — both 0-9-1 and 1.0 share this magic)
+    [0x41 0x4D 0x51 0x50 0x00 0x00 0x09 0x01] → AMQP 0-9-1 (protocol header bytes 4-7 = 0,0,9,1)
+    [0x41 0x4D 0x51 0x50 0x00 0x01 0x00 0x00] → AMQP 1.0   (bytes 4-7 = 0,1,0,0)
+    Detect by peeking 8 bytes: byte[5] = 0x00 means 1.0, byte[5] = 0x09 means 0-9-1
+<len:3><seq:1>0x0A      → MySQL (handshake packet, server greeting type=0x0A)
+0x00 0x00 0x00 ??       → PgWire (first 4 bytes = message length, next 4 = 196608 = proto 3.0)
+                                  Disambiguate from Kafka: byte[4..7] = 0x00 0x03 0x00 0x00
 ```
 
 **Netty pipeline installation:**
@@ -183,6 +190,111 @@ Basic.Publish → write to broker → on PG COMMIT → Basic.Ack(deliveryTag, mu
 
 ---
 
+## AMQP 1.0 Protocol (port 5673)
+
+AMQP 1.0 is a fundamentally different wire protocol from 0-9-1 — not a version upgrade
+but a separate ISO/IEC 19464 standard. Used by Azure Service Bus, ActiveMQ Artemis,
+Apache Qpid, and RabbitMQ (via plugin).
+
+### Frame Structure
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Frame Header (8 bytes)                               │
+│  [size:4][doff:1][type:1][type-specific:2]           │
+│  type=0x00: AMQP frame                               │
+│  type=0x01: SASL frame                               │
+├──────────────────────────────────────────────────────┤
+│ Extended Header (doff*4 - 8 bytes, usually 0)        │
+├──────────────────────────────────────────────────────┤
+│ Performative (AMQP type-encoded descriptor + body)   │
+└──────────────────────────────────────────────────────┘
+```
+
+### Connection / Session / Link Hierarchy
+
+```
+Connection (TCP)
+  └── Session (1..N per connection, bidirectional)
+        └── Link (1..N per session, unidirectional)
+              Sender Link  → messages flow to broker  (producer)
+              Receiver Link ← messages flow to client (consumer)
+```
+
+### Performative Types (key subset)
+
+| Descriptor | Name | Direction | Purpose |
+|------------|------|-----------|---------|
+| 0x10 | open | C↔S | Connection-level negotiation (max-frame-size, channel-max) |
+| 0x11 | begin | C↔S | Open a session |
+| 0x12 | attach | C↔S | Attach a link (source, target, role=sender/receiver) |
+| 0x13 | flow | C↔S | Flow control (link-credit, delivery-count) |
+| 0x14 | transfer | C→S | Deliver a message on a sender link |
+| 0x15 | disposition | C↔S | Settle deliveries (accepted, rejected, released, modified) |
+| 0x16 | detach | C↔S | Detach a link (with optional error) |
+| 0x17 | end | C↔S | End a session |
+| 0x18 | close | C↔S | Close connection |
+
+### Message Format (AMQP Value Sections)
+
+```
+[header]          — durable, priority, ttl, first-acquirer, delivery-count
+[delivery-annotations]   — per-delivery metadata (map)
+[message-annotations]    — per-message metadata (map)
+[properties]      — message-id, user-id, to, subject, reply-to, content-type, ...
+[application-properties] — user-defined key/value map  ← maps to Ivy headers
+[body]            — amqp-value | amqp-sequence | data section ← maps to Ivy value
+[footer]          — delivery metadata applied after body
+```
+
+### AMQP 1.0 → Ivy Mapping
+
+```
+AMQP 1.0 target address    → Ivy topic name (from link Attach.target.address)
+AMQP 1.0 source address    → Ivy topic name (from link Attach.source.address)
+AMQP 1.0 transfer payload  → Ivy PendingWrite(value = body, headers = application-properties)
+AMQP 1.0 disposition(accepted) → Ivy consumer offset commit
+AMQP 1.0 disposition(rejected) → Ivy DlqRouter (requeue=false semantics)
+AMQP 1.0 disposition(released) → requeue (no DLQ)
+AMQP 1.0 disposition(modified{undeliverable=true}) → Ivy DlqRouter
+```
+
+### Flow Control
+
+AMQP 1.0 uses **link credit** for flow control (unlike 0-9-1 which uses Qos.prefetch-count):
+```
+Receiver → broker: flow(link-credit=100)   ← "I can accept 100 more messages"
+Broker sends up to 100 transfer frames
+Receiver → broker: flow(link-credit=50)    ← replenish credit
+```
+
+`Amqp10SessionHandler` tracks `linkCredit` per link and buffers outgoing transfers.
+
+### Settlement Modes
+
+| Mode | Sender | Receiver | Semantics |
+|------|--------|----------|-----------|
+| `at-most-once` | settled=true | — | Fire and forget |
+| `at-least-once` | settled=false | settles on disposition | At least once (default) |
+| `exactly-once` | settled=false | coordinates with sender | Two-phase settlement |
+
+### SASL (connection-level)
+
+AMQP 1.0 uses a SASL exchange before the AMQP open frame:
+```
+S→C: sasl-mechanisms([PLAIN, SCRAM-SHA-256])
+C→S: sasl-init(mechanism=PLAIN, initial-response=\0user\0pass)
+S→C: sasl-outcome(code=OK)
+     — AMQP open frame follows
+```
+
+### DLQ in AMQP 1.0
+
+`disposition(rejected, error={condition="amqp:rejected"})` triggers `DlqRouter`.
+`disposition(modified, delivery-failed=true, undeliverable-here=true)` also triggers DLQ.
+
+---
+
 ## MQTT 3.1.1 Protocol (port 1883 / 8883 TLS)
 
 ### Packet Types
@@ -247,6 +359,127 @@ willTopic, willPayload, willQos, willRetain
 ```
 Published to broker on unexpected disconnect (no DISCONNECT packet received).
 `clientId` prefix is used as the will message key for tracking.
+
+---
+
+## MQTT 5.0 Protocol (port 1884 / 8884 TLS, or shared 1883 via version byte)
+
+MQTT 5.0 adds significant features over 3.1.1 while keeping backward wire compatibility.
+The version byte in CONNECT (byte[9]) distinguishes them: `0x04` = 3.1.1, `0x05` = 5.0.
+
+### New Packet Types vs 3.1.1
+
+| Type | Packet | Notes |
+|------|--------|-------|
+| 15 | AUTH | New in 5.0 — enhanced authentication exchange |
+| DISCONNECT now has Reason Code + Properties | — | Client can now send reason code |
+
+All 3.1.1 packet types exist in 5.0 with extended properties sections.
+
+### Key New Features
+
+**1. User Properties (application-level headers)**
+Every packet type in MQTT 5.0 can carry a list of user properties (key/value UTF-8 string pairs).
+These map directly to Ivy message headers:
+```
+MQTT 5.0 PUBLISH user-property "order-id" = "12345"
+  → stored in Ivy headers: packed [key_len:2]["order-id"][val_len:4]["12345"]
+  → available when consumed via Kafka or AMQP (header round-trip)
+```
+
+**2. Message Expiry Interval**
+```
+PUBLISH property: Message-Expiry-Interval = 300  (seconds)
+  → broker stores expiry as timestamp = publish_time + 300s
+  → if consumer fetches after expiry → message routed to DLQ (TTL_EXPIRED)
+  → on re-delivery, remaining expiry is decremented in the delivered PUBLISH
+```
+
+**3. Subscription Options (SUBSCRIBE)**
+```
+subscription-identifier  → correlate received PUBLISH back to a subscription
+retain-as-published      → forward the RETAIN flag as-is to subscriber
+retain-handling: 0/1/2   → 0=send retained on subscribe, 1=only if new sub, 2=never
+no-local                 → don't receive own publishes (per-connection flag)
+```
+
+**4. Shared Subscriptions**
+```
+SUBSCRIBE $share/<group-name>/<topic-filter>
+  → maps to Ivy consumer group (group-name) on the resolved partitions
+  → messages distributed round-robin across group members
+  → equivalent to Kafka consumer group semantics
+```
+`$share/` prefix is detected in `MqttRequestHandler.subscribe()` and routed to `ConsumerGroupCoordinator`.
+
+**5. Request/Response Pattern**
+```
+PUBLISH properties:
+  response-topic  = "replies/order-status"
+  correlation-data = <binary id>
+
+Responder:
+  PUBLISH to "replies/order-status" with same correlation-data
+```
+Ivy stores `response-topic` and `correlation-data` as headers and passes them through unchanged.
+
+**6. Reason Codes (all packets)**
+Every acknowledgement in 5.0 carries a reason code byte (not just success/fail):
+```
+PUBACK reason codes: 0x00 Success, 0x10 No matching subscribers, 0x80 Unspecified error, ...
+SUBACK reason codes: 0x00 QoS0, 0x01 QoS1, 0x02 QoS2, 0x80 Not authorized, ...
+DISCONNECT reason codes: 0x00 Normal, 0x81 Malformed packet, 0x89 Keep-alive timeout, ...
+```
+
+**7. Topic Aliases**
+Client can assign a short integer alias to a long topic name:
+```
+PUBLISH topic="very/long/topic/name" topic-alias=5
+→ subsequent PUBLISH topic="" topic-alias=5  (empty topic = use alias)
+```
+`MqttSessionState` maintains a `Map<Short, TopicName> topicAliasMap` per connection.
+
+**8. Enhanced Authentication (AUTH packet)**
+```
+CONNECT auth-method="SCRAM-SHA-256" auth-data=<client-first>
+S→C: AUTH reason=0x18 (continue) auth-data=<server-first>
+C→S: AUTH reason=0x18 auth-data=<client-final>
+S→C: CONNACK reason=0x00 auth-data=<server-final>
+```
+
+**9. Session Expiry Interval**
+```
+CONNECT session-expiry-interval = 3600   (seconds; 0 = clean session, 0xFFFFFFFF = persistent)
+DISCONNECT session-expiry-interval = 0   (can override on disconnect)
+```
+Stored in `consumer_groups.config` and enforced by `MqttSessionManager`.
+
+**10. Flow Control (Receive Maximum)**
+```
+CONNECT receive-maximum = 20    ← client tells broker: max 20 in-flight QoS 1/2 messages
+→ broker tracks per-session in-flight count, pauses delivery at limit
+```
+
+### MQTT 5.0 → Ivy Mapping (additions to 3.1.1 mapping)
+
+```
+MQTT 5.0 user-properties      → Ivy headers (added alongside MQTT 3.1.1 headers)
+MQTT 5.0 message-expiry       → Ivy DLQ on expiry (TTL_EXPIRED)
+MQTT 5.0 shared subscriptions → Ivy ConsumerGroupCoordinator
+MQTT 5.0 response-topic       → stored as header "mqtt5-response-topic"
+MQTT 5.0 correlation-data     → stored as header "mqtt5-correlation-data"
+MQTT 5.0 content-type         → stored as header "mqtt5-content-type"
+MQTT 5.0 topic-alias          → resolved to full topic name before storage (aliases not persisted)
+```
+
+### Handler Structure
+
+`Mqtt5RequestHandler` extends `Mqtt311RequestHandler`:
+- Shares all QoS 0/1/2 logic, retained messages, will messages
+- Overrides: CONNECT parsing (version=5, session-expiry, receive-maximum, auth-method)
+- Adds: AUTH packet handling, topic alias resolution, user-property injection into headers
+- Adds: shared subscription detection (`$share/`) → ConsumerGroupCoordinator
+- Adds: reason codes in all PUBACK/SUBACK/UNSUBACK/DISCONNECT responses
 
 ---
 

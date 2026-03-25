@@ -354,33 +354,50 @@ Each codec has two responsibilities:
 1. **Decoder:** `ByteBuf` → protocol-specific request/frame object
 2. **Encoder:** response/frame object → `ByteBuf`
 
+Package structure mirrors `clustering` — one sub-package per protocol:
+
 ```
-KafkaCodec:
-  KafkaRequestDecoder  — reads request header (apiKey, apiVersion, correlationId) + body
-  KafkaResponseEncoder — writes response header (correlationId) + body
-  KafkaApiVersions     — supported API key versions table
+com.ivy.codec/
+  kafka/
+    KafkaRequestDecoder    — reads request header (apiKey, apiVersion, correlationId) + body
+    KafkaResponseEncoder   — writes response header (correlationId) + body
+    KafkaApiVersions       — supported API key × version table
+    KafkaRequest           — sealed interface for all request types
+    KafkaResponse          — sealed interface for all response types
 
-AmqpCodec:
-  AmqpFrameDecoder     — reads [frame_type:1][channel:2][payload_size:4][payload:N][0xCE]
-  AmqpFrameEncoder     — writes same
-  AmqpMethodCodec      — encodes/decodes class+method+arguments for each AMQP method
+  amqp/                    ← AMQP 0-9-1
+    Amqp091FrameDecoder    — reads [frame_type:1][channel:2][payload_size:4][payload:N][0xCE]
+    Amqp091FrameEncoder    — writes same
+    Amqp091MethodCodec     — encodes/decodes class+method+arguments
+    Amqp091Frame           — sealed interface (MethodFrame, HeaderFrame, BodyFrame, HeartbeatFrame)
 
-MqttCodec:
-  MqttDecoder          — reads [fixed_header:1][remaining_length:1-4][payload:N]
-  MqttEncoder          — writes same
-  MqttPacketTypes      — CONNECT, PUBLISH, SUBSCRIBE, etc.
+  amqp10/                  ← AMQP 1.0
+    Amqp10FrameDecoder     — reads [size:4][doff:1][type:1][type-specific:2][payload]
+    Amqp10FrameEncoder     — writes same
+    Amqp10TypeCodec        — AMQP type system (described types, lists, maps, primitives)
+    Amqp10Performative     — sealed interface (Open, Begin, Attach, Flow, Transfer, Disposition, Detach, End, Close)
+    Amqp10MessageCodec     — message sections (header, properties, application-properties, body, footer)
 
-MySqlCodec:
-  MySqlHandshakeEncoder — writes server greeting (HandshakeV10)
-  MySqlPacketDecoder    — reads [length:3][sequence:1][payload:N]
-  MySqlResultSetEncoder — writes ColumnDefinition41 + rows + EOF
+  mqtt/                    ← MQTT 3.1.1 AND 5.0 share base; 5.0 extends
+    MqttDecoder            — reads [fixed_header:1][remaining_length:1-4][payload:N]
+    MqttEncoder            — writes same
+    Mqtt311Packet          — sealed interface for all MQTT 3.1.1 packet types
+    Mqtt5Packet            — sealed interface extending 3.1.1 with 5.0 properties
+    Mqtt5PropertiesCodec   — encodes/decodes MQTT 5.0 property sets
 
-PgWireCodec:
-  PgStartupDecoder      — reads StartupMessage (length + protocol + params)
-  PgMessageDecoder      — reads [type:1][length:4][payload:N]
-  PgMessageEncoder      — writes same
-  PgRowDescEncoder      — writes RowDescription for a given schema
-  PgDataRowEncoder      — writes DataRow for each result record
+  mysql/
+    MySqlHandshakeEncoder  — writes server greeting (HandshakeV10)
+    MySqlPacketDecoder     — reads [length:3][sequence:1][payload:N]
+    MySqlResultSetEncoder  — writes ColumnDefinition41 + rows + EOF
+    MySqlOkErrEncoder      — writes OK_Packet and ERR_Packet
+
+  pg/                      ← PgWire
+    PgStartupDecoder       — reads StartupMessage (length + protocol version + params)
+    PgMessageDecoder       — reads [type:1][length:4][payload:N]
+    PgMessageEncoder       — writes same
+    PgRowDescEncoder       — writes RowDescription for a given schema
+    PgDataRowEncoder       — writes DataRow for each result record
+    PgErrorEncoder         — writes ErrorResponse with SQLSTATE fields
 ```
 
 ---
@@ -427,23 +444,28 @@ public static void main(String[] args) {
         writeAccumulator, writeWorker, readAccumulator, dlqRouter,
         groupCoordinator, txCoordinator, hrwRouter, forwardMgr, storageEngine);
 
-    // Protocol codecs
-    var kafkaCodec   = new KafkaCodec();
-    var amqpCodec    = new AmqpCodec();
-    var mqttCodec    = new MqttCodec();
-    var mysqlCodec   = new MySqlCodec();
-    var pgwireCodec  = new PgWireCodec();
+    // Protocol codecs (one instance per protocol variant)
+    var kafkaCodec     = new KafkaRequestDecoder();
+    var amqp091Codec   = new Amqp091FrameDecoder();
+    var amqp10Codec    = new Amqp10FrameDecoder();
+    var mqtt311Codec   = new MqttDecoder(MqttVersion.V3_1_1);
+    var mqtt5Codec     = new MqttDecoder(MqttVersion.V5);
+    var mysqlCodec     = new MySqlPacketDecoder();
+    var pgwireCodec    = new PgStartupDecoder();
 
-    // Handlers
+    // Handlers — one per protocol variant, each in its own package
     var kafkaHandler   = new KafkaRequestHandler(brokerEngine, authEngine, kafkaCodec);
-    var amqpHandler    = new AmqpRequestHandler(brokerEngine, authEngine, amqpCodec);
-    var mqttHandler    = new MqttRequestHandler(brokerEngine, authEngine, mqttCodec);
+    var amqp091Handler = new Amqp091RequestHandler(brokerEngine, authEngine, amqp091Codec);
+    var amqp10Handler  = new Amqp10RequestHandler(brokerEngine, authEngine, amqp10Codec);
+    var mqtt311Handler = new Mqtt311RequestHandler(brokerEngine, authEngine, mqtt311Codec);
+    var mqtt5Handler   = new Mqtt5RequestHandler(brokerEngine, authEngine, mqtt5Codec);
     var mysqlHandler   = new MySqlRequestHandler(brokerEngine, authEngine, mysqlCodec);
     var pgwireHandler  = new PgWireRequestHandler(brokerEngine, authEngine, pgwireCodec);
 
     // Netty
     var pipelineFactory = new NettyPipelineFactory(
-        kafkaHandler, amqpHandler, mqttHandler, mysqlHandler, pgwireHandler, config);
+        kafkaHandler, amqp091Handler, amqp10Handler,
+        mqtt311Handler, mqtt5Handler, mysqlHandler, pgwireHandler, config);
     var server = new NettyBrokerServer(pipelineFactory, config);
 
     // Lifecycle
@@ -471,7 +493,64 @@ EventLoop thread:
   [ServerExceptionHandler]     catch-all, log + close
 ```
 
-### Per-Protocol Handler Structure
+### Handler Package Structure
+
+Mirrors the `clustering` project: one sub-package per protocol in `com.ivy.server.handler/`:
+
+```
+com.ivy.server.handler/
+  kafka/
+    KafkaRequestHandler        — main dispatcher
+    KafkaProduceHandler        — Produce API (v3-v9)
+    KafkaFetchHandler          — Fetch API (v4-v15)
+    KafkaMetadataHandler       — Metadata, DescribeCluster
+    KafkaConsumerGroupHandler  — JoinGroup, SyncGroup, Heartbeat, LeaveGroup, OffsetCommit/Fetch
+    KafkaTransactionHandler    — InitProducerId, AddPartitions, EndTxn, TxnOffsetCommit
+    KafkaAdminHandler          — CreateTopics, DeleteTopics, DescribeConfigs
+    KafkaSaslHandler           — SaslHandshake, SaslAuthenticate
+
+  amqp091/
+    Amqp091RequestHandler      — main dispatcher
+    Amqp091ConnectionHandler   — Connection.Start/Tune/Open/Close
+    Amqp091ChannelHandler      — Channel.Open/Close
+    Amqp091ExchangeHandler     — Exchange.Declare/Delete
+    Amqp091QueueHandler        — Queue.Declare/Bind/Unbind/Purge/Delete
+    Amqp091BasicHandler        — Basic.Publish/Consume/Get/Ack/Nack/Reject/Cancel/Qos
+    Amqp091ConfirmHandler      — Confirm.Select, Basic.Ack/Nack for publisher confirms
+    Amqp091TxHandler           — Tx.Select/Commit/Rollback
+    Amqp091SessionState        — per-channel: exchanges, queues, consumers, confirms
+
+  amqp10/
+    Amqp10RequestHandler       — main dispatcher
+    Amqp10ConnectionHandler    — Open/Close performatives, SASL exchange
+    Amqp10SessionHandler       — Begin/End, link management
+    Amqp10SenderLinkHandler    — Attach(sender), Transfer, Disposition settlement
+    Amqp10ReceiverLinkHandler  — Attach(receiver), Flow credit management, Disposition
+    Amqp10SessionState         — per-session: links, delivery tracking, flow control
+
+  mqtt/
+    Mqtt311RequestHandler      — main dispatcher for MQTT 3.1.1
+    Mqtt5RequestHandler        — extends Mqtt311RequestHandler with 5.0 features
+    MqttConnectHandler         — CONNECT / CONNACK (shared, version-dispatched)
+    MqttPublishHandler         — PUBLISH + QoS 0/1/2 flows (PUBACK, PUBREC, PUBREL, PUBCOMP)
+    MqttSubscribeHandler       — SUBSCRIBE / SUBACK, topic filter matching
+    MqttUnsubscribeHandler     — UNSUBSCRIBE / UNSUBACK
+    Mqtt5AuthHandler           — AUTH packet (MQTT 5.0 enhanced auth)
+    MqttSessionState           — per-connection: will, subscriptions, QoS 2 state, topic aliases (5.0)
+    MqttSharedSubHandler       — $share/ prefix → ConsumerGroupCoordinator (MQTT 5.0)
+
+  mysql/
+    MySqlRequestHandler        — handshake + COM_QUERY dispatch
+    MySqlQueryExecutor         — SqlQueryParser → BrokerEngine.fetch() or metadata PG query
+    MySqlSessionState          — per-connection auth state
+
+  pgwire/
+    PgWireRequestHandler       — startup + simple query dispatch
+    PgWireQueryExecutor        — SqlQueryParser → BrokerEngine.fetch() or metadata PG query
+    PgWireSessionState         — per-connection auth state, parameter status
+```
+
+### Per-Protocol Handler Pattern
 
 Each handler implements `ChannelInboundHandlerAdapter`:
 
@@ -482,11 +561,14 @@ channelRead(ctx, msg):
   secCtx = sessionState.getOrCreate(ctx.channel())
 
   switch (decoded) {
-    case Kafka: dispatch to KafkaRequestDispatcher
-    case Amqp:  dispatch to AmqpMethodDispatcher
-    case Mqtt:  dispatch to MqttPacketDispatcher
-    case MySql: dispatch to MySqlQueryExecutor
-    case PgWire: dispatch to PgWireQueryExecutor
+    // Each handler delegates to sub-handlers by request type:
+    case Kafka:   kafkaRequestDispatcher.dispatch(decoded, ctx, secCtx)
+    case Amqp091: amqp091Dispatcher.dispatch(decoded, ctx, secCtx)
+    case Amqp10:  amqp10Dispatcher.dispatch(decoded, ctx, secCtx)
+    case Mqtt311: mqttDispatcher.dispatch(decoded, ctx, secCtx)
+    case Mqtt5:   mqtt5Dispatcher.dispatch(decoded, ctx, secCtx)
+    case MySql:   mysqlQueryExecutor.execute(decoded, ctx, secCtx)
+    case PgWire:  pgwireQueryExecutor.execute(decoded, ctx, secCtx)
   }
 
   response = brokerEngine.write(...) or brokerEngine.fetch(...)

@@ -2,9 +2,10 @@
 
 ## Vision
 
-A focused, production-quality multi-protocol message broker with five protocol adapters
-(Kafka, AMQP, MQTT, MySQL-wire, PgWire), PostgreSQL as the single source of truth,
-HRW-based partition leadership for clustering, and first-class dead letter queues.
+A focused, production-quality multi-protocol message broker with seven protocol adapters
+(Kafka, AMQP 0-9-1, AMQP 1.0, MQTT 3.1.1, MQTT 5.0, MySQL-wire, PgWire), PostgreSQL as
+the single source of truth, HRW-based partition leadership for clustering, and first-class
+dead letter queues.
 
 Everything is a log. Every protocol writes to the same partitions. Every consumer reads
 from the same offsets. PostgreSQL decides durability; the broker decides routing.
@@ -17,14 +18,14 @@ from the same offsets. PostgreSQL decides durability; the broker decides routing
 ┌──────────────────────────────────────────────────────────────────┐
 │                         ivy-server                               │
 │                                                                  │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐ ┌────────┐ │
-│  │  Kafka   │ │   AMQP   │ │   MQTT   │ │  MySQL  │ │PgWire  │ │
-│  │ Handler  │ │ Handler  │ │ Handler  │ │ Handler │ │Handler │ │
-│  └──────────┘ └──────────┘ └──────────┘ └─────────┘ └────────┘ │
+│  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌──────┐ ┌──────┐ │
+│  │ Kafka  │ │AMQP091 │ │AMQP 10 │ │MQTT311 │ │ MQTT5  │ │MySQL │ │ PG   │ │
+│  │Handler │ │Handler │ │Handler │ │Handler │ │Handler │ │Handlr│ │Handlr│ │
+│  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └──────┘ └──────┘ │
 │  NettyPipelineFactory │ ProtocolDetector │ BrokerMain            │
 ├──────────────────────────────────────────────────────────────────┤
 │                         ivy-codec                                │
-│  KafkaCodec │ AmqpCodec │ MqttCodec │ MySqlCodec │ PgWireCodec  │
+│  KafkaCodec │ Amqp091Codec │ Amqp10Codec │ Mqtt311Codec │ Mqtt5Codec │ MySqlCodec │ PgWireCodec  │
 ├──────────────────────────────────────────────────────────────────┤
 │                         ivy-broker                               │
 │  BrokerEngine │ WriteWorker │ ReadAccumulator │ DlqRouter        │
@@ -119,9 +120,9 @@ Consumer nacks / TTL expires / max-retries exceeded
 | Storage source of truth | PostgreSQL (PG-first) | ACID durability; ACK only after PG COMMIT |
 | LogSegment role | Async read cache | Performance optimization; not required for correctness |
 | Leadership election | HRW (Rendezvous Hash) | No Raft complexity; deterministic; O(1) lookup |
-| Protocol count | 5 (focused) | Completeness over breadth; avoids conduktor-ivy scope creep |
+| Protocol count | 7 (focused) | Kafka + AMQP 0-9-1 + AMQP 1.0 + MQTT 3.1.1 + MQTT 5.0 + MySQL + PgWire |
 | Module count | 5 (clean) | Each module has a single clear responsibility |
-| DLQ | First-class, all 5 protocols | Missing in ivy-v9; essential for AMQP/MQTT semantics |
+| DLQ | First-class, all messaging protocols | Missing in ivy-v9; essential for AMQP/MQTT semantics |
 | Multi-tenancy | Yes, SNI-based | Essential for SaaS; TenantId scopes all operations |
 | Java version | 26 + `--enable-preview` | Valhalla value classes; matches mature reference projects |
 | SQL protocols | Read-only query view | Observability/debugging; not full messaging endpoints |
@@ -136,7 +137,9 @@ Consumer nacks / TTL expires / max-retries exceeded
 |----------|-------------|----------|
 | Kafka | 9092 | 9093 |
 | AMQP 0-9-1 | 5672 | 5671 |
+| AMQP 1.0 | 5673 | — (shared with 0-9-1 via negotiation, or separate) |
 | MQTT 3.1.1 | 1883 | 8883 |
+| MQTT 5.0 | 1884 | 8884 (or shared 1883 via version negotiation) |
 | MySQL wire | 3306 | 3307 |
 | PgWire | 5432 | 5433 |
 | Inter-broker RPC | 9094 | — |
@@ -150,6 +153,7 @@ Consumer nacks / TTL expires / max-retries exceeded
 |-----------|---------|---------|
 | Language | Java | 26 + `--enable-preview` |
 | Network I/O | Netty | 4.2.x |
+| Kafka client (testing only) | kafka-clients | **4.2.0** |
 | Database | PostgreSQL JDBC | 42.7.x |
 | Connection pool | HikariCP | 6.x |
 | Metrics | Micrometer + Prometheus | 1.14.x |

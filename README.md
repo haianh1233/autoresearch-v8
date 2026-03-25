@@ -4,7 +4,7 @@ A focused, production-quality multi-protocol message broker.
 
 ## What it is
 
-- **5 protocols**: Kafka, AMQP 0-9-1, MQTT 3.1.1, MySQL wire (read-only), PgWire (read-only)
+- **7 protocols**: Kafka, AMQP 0-9-1, AMQP 1.0, MQTT 3.1.1, MQTT 5.0, MySQL wire (read-only), PgWire (read-only)
 - **PostgreSQL** as single source of truth (PG-first writes, ACK after COMMIT)
 - **Clustering** via HRW partition leadership — no Raft, no Zookeeper
 - **Dead letter queues** — first-class, all protocols, configurable triggers
@@ -50,8 +50,10 @@ Client → Protocol Handler → BrokerEngine
 | Protocol | Port |
 |----------|------|
 | Kafka | 9092 |
-| AMQP | 5672 |
-| MQTT | 1883 |
+| AMQP 0-9-1 | 5672 |
+| AMQP 1.0 | 5673 |
+| MQTT 3.1.1 | 1883 |
+| MQTT 5.0 | 1884 |
 | MySQL | 3306 |
 | PgWire | 5432 |
 | Inter-broker RPC | 9094 |

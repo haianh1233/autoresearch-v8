@@ -63,6 +63,7 @@
 - [ ] `GracefulShutdown`
 
 ### Tests
+**kafka-clients version: `4.2.0` (stable release — not 4.3-SNAPSHOT)**
 - [ ] `KafkaProducerConsumerE2E` — produce 10K, consume, verify all offsets
 - [ ] `KafkaConsumerGroupE2E` — join group, rebalance, commit offsets
 - [ ] `KafkaTransactionE2E` — produce transactionally, commit + abort
@@ -71,14 +72,15 @@
 
 ---
 
-## Phase 2 — AMQP + MQTT + DLQ
+## Phase 2 — AMQP 0-9-1 + AMQP 1.0 + MQTT 3.1.1 + MQTT 5.0 + DLQ
 
-**Goal:** Two more protocols + dead letter queues working end to end.
+**Goal:** Four messaging protocols + dead letter queues working end to end.
 
-### ivy-codec (AMQP + MQTT)
-- [ ] `AmqpFrameDecoder` / `AmqpFrameEncoder`
-- [ ] `AmqpMethodCodec` — all AMQP 0-9-1 methods
-- [ ] `MqttDecoder` / `MqttEncoder` — all MQTT 3.1.1 packet types
+### ivy-codec (AMQP + MQTT — all variants)
+- [ ] `amqp/Amqp091FrameDecoder` / `Amqp091FrameEncoder` / `Amqp091MethodCodec`
+- [ ] `amqp10/Amqp10FrameDecoder` / `Amqp10FrameEncoder` / `Amqp10TypeCodec` / `Amqp10MessageCodec`
+- [ ] `mqtt/MqttDecoder` / `MqttEncoder` — MQTT 3.1.1 (version byte = 0x04)
+- [ ] `mqtt/Mqtt5PropertiesCodec` — MQTT 5.0 extended properties (version byte = 0x05)
 
 ### ivy-broker (DLQ)
 - [ ] `DlqRouter` — trigger evaluation, header injection, DLQ partition routing
@@ -87,23 +89,60 @@
 - [ ] `DlqConfig` — per-topic configuration
 - [ ] V2__add_dlq_entries.sql migration
 
-### ivy-server (AMQP + MQTT handlers)
-- [ ] `AmqpRequestHandler` — Connection, Channel, Exchange, Queue, Basic, Confirm, Tx
-- [ ] `AmqpSessionState` — per-channel state (exchanges, queues, consumers)
-- [ ] `MqttRequestHandler` — Connect, Publish, Subscribe, Unsubscribe, Disconnect
-- [ ] `MqttSessionState` — cleanSession, will, subscriptions
-- [ ] Update `ProtocolDetector` for AMQP + MQTT
-- [ ] Update `NettyPipelineFactory` for all 3 protocols
+### ivy-server (AMQP + MQTT handlers — separate packages)
+**AMQP 0-9-1** (`handler/amqp091/`):
+- [ ] `Amqp091RequestHandler` — main dispatcher
+- [ ] `Amqp091ConnectionHandler`, `Amqp091ChannelHandler`
+- [ ] `Amqp091ExchangeHandler`, `Amqp091QueueHandler`
+- [ ] `Amqp091BasicHandler` — Publish/Consume/Get/Ack/Nack/Reject
+- [ ] `Amqp091ConfirmHandler` — publisher confirms
+- [ ] `Amqp091TxHandler` — Tx.Select/Commit/Rollback
+- [ ] `Amqp091SessionState` — per-channel exchanges, queues, consumers, confirms
+
+**AMQP 1.0** (`handler/amqp10/`):
+- [ ] `Amqp10RequestHandler` — main dispatcher
+- [ ] `Amqp10ConnectionHandler` — Open/Close + SASL exchange
+- [ ] `Amqp10SessionHandler` — Begin/End
+- [ ] `Amqp10SenderLinkHandler` — Attach(sender), Transfer, Disposition
+- [ ] `Amqp10ReceiverLinkHandler` — Attach(receiver), Flow credit, Disposition
+- [ ] `Amqp10SessionState` — per-session links, delivery tracking, flow control
+
+**MQTT 3.1.1** (`handler/mqtt/`):
+- [ ] `Mqtt311RequestHandler` — main dispatcher
+- [ ] `MqttConnectHandler` — CONNECT/CONNACK (shared with 5.0)
+- [ ] `MqttPublishHandler` — PUBLISH + QoS 0/1/2 state machine
+- [ ] `MqttSubscribeHandler`, `MqttUnsubscribeHandler`
+- [ ] `MqttSessionState` — will, subscriptions, QoS 2 state
+
+**MQTT 5.0** (`handler/mqtt/` — extends 3.1.1):
+- [ ] `Mqtt5RequestHandler` — extends `Mqtt311RequestHandler`, version-dispatched at CONNECT
+- [ ] `Mqtt5AuthHandler` — AUTH packet exchange
+- [ ] `MqttSharedSubHandler` — `$share/` prefix → ConsumerGroupCoordinator
+- [ ] MQTT 5.0 user-properties → Ivy headers mapping
+- [ ] Message-Expiry-Interval → DLQ (TTL_EXPIRED)
+- [ ] Topic alias resolution in `MqttSessionState`
+
+- [ ] Update `ProtocolDetector` — AMQP version discrimination (bytes 4-7), MQTT version read from CONNECT payload
+- [ ] Update `NettyPipelineFactory` — 5 messaging protocol handlers
 
 ### Tests
-- [ ] `AmqpPublishConsumeE2E` — exchange declare, queue bind, publish, ack
-- [ ] `AmqpDlqE2E` — nack(requeue=false) → verify message in `__dlq.<topic>`
-- [ ] `AmqpTtlDlqE2E` — message TTL expires → DLQ with reason=TTL_EXPIRED
-- [ ] `MqttQos0E2E`, `MqttQos1E2E`, `MqttQos2E2E`
-- [ ] `MqttRetainedE2E` — retained message delivered on subscribe
-- [ ] `MqttWillE2E` — unexpected disconnect → will published
+- [ ] `Amqp091PublishConsumeE2E` — exchange types (direct/fanout/topic), queue bind, ack
+- [ ] `Amqp091DlqE2E` — nack(requeue=false) → `__dlq.<topic>`; x-death header present
+- [ ] `Amqp091TtlDlqE2E` — x-message-ttl expires → DLQ reason=TTL_EXPIRED
+- [ ] `Amqp091PublisherConfirmsE2E` — Confirm.Select, Basic.Ack per message
+- [ ] `Amqp10PublishConsumeE2E` — Attach sender + receiver, Transfer, Disposition(accepted)
+- [ ] `Amqp10DlqE2E` — Disposition(rejected) → `__dlq.<topic>`
+- [ ] `Amqp10FlowControlE2E` — link-credit exhaustion → broker pauses, credit refresh → resumes
+- [ ] `Mqtt311Qos0E2E`, `Mqtt311Qos1E2E`, `Mqtt311Qos2E2E`
+- [ ] `Mqtt311RetainedE2E` — retained message delivered on subscribe
+- [ ] `Mqtt311WillE2E` — unexpected disconnect → will published
+- [ ] `Mqtt5UserPropertiesE2E` — publish with user-properties → consumed via Kafka with headers
+- [ ] `Mqtt5SharedSubE2E` — `$share/group/topic` distributes to multiple consumers
+- [ ] `Mqtt5MessageExpiryDlqE2E` — message-expiry-interval exceeded → DLQ
+- [ ] `Mqtt5EnhancedAuthE2E` — AUTH packet SCRAM-SHA-256 exchange
 - [ ] `DlqRouterTest` — all 5 trigger conditions unit-tested
-- [ ] `CrossProtocolE2E` — produce via Kafka, consume via AMQP
+- [ ] `CrossProtocolAmqpKafkaE2E` — produce via AMQP 0-9-1, consume via Kafka
+- [ ] `CrossProtocolMqttAmqp10E2E` — produce via MQTT 5.0, consume via AMQP 1.0
 
 ---
 
