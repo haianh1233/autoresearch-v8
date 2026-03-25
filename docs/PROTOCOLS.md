@@ -36,37 +36,31 @@ They are **append-only** — never reuse or reorder an ID.
 
 ---
 
-## Protocol Detection (magic bytes)
+## Port = Protocol (no detection needed)
 
-`ProtocolDetector` peeks at the first 4 bytes without consuming them.
-HTTP connections arrive on a dedicated port (8081) and do not need magic-byte detection.
+Each protocol binds to its own dedicated port with a pre-wired `ServerBootstrap`. There is no
+magic-byte sniffing. The protocol is known at bind time; the correct codec is installed into
+the Netty pipeline before the first byte arrives.
 
 ```
-Bytes 0-3               → Protocol
-──────────────────────────────────────────────────────────────────────────────
-0x00 0x?? ...           → Kafka  (MSB-first 4-byte request length, starts near 0)
-0x10 - 0xEF             → MQTT 3.1.1  (first byte = control packet type; CONNECT = 0x10)
-                                       Note: MQTT 5.0 also starts with 0x10 (CONNECT)
-                                       → version detected inside CONNECT payload (byte[9])
-                                         0x04 = MQTT 3.1.1, 0x05 = MQTT 5.0
-0x41 0x4D 0x51 0x50     → AMQP  ("AMQP" ASCII — both 0-9-1 and 1.0 share this magic)
-    [0x41 0x4D 0x51 0x50 0x00 0x00 0x09 0x01] → AMQP 0-9-1 (protocol header bytes 4-7 = 0,0,9,1)
-    [0x41 0x4D 0x51 0x50 0x00 0x01 0x00 0x00] → AMQP 1.0   (bytes 4-7 = 0,1,0,0)
-    Detect by peeking 8 bytes: byte[5] = 0x00 means 1.0, byte[5] = 0x09 means 0-9-1
-<len:3><seq:1>0x0A      → MySQL (handshake packet, server greeting type=0x0A)
-0x00 0x00 0x00 ??       → PgWire (first 4 bytes = message length, next 4 = 196608 = proto 3.0)
-                                  Disambiguate from Kafka: byte[4..7] = 0x00 0x03 0x00 0x00
+BrokerMain binds:
+  port 9092  → KafkaServerBootstrap   (KafkaFrameDecoder + KafkaRequestHandler pre-installed)
+  port 9093  → KafkaServerBootstrap + TLS
+  port 5672  → Amqp091ServerBootstrap
+  port 5671  → Amqp091ServerBootstrap + TLS
+  port 5673  → Amqp10ServerBootstrap
+  port 5674  → Amqp10ServerBootstrap  + TLS
+  port 1883  → MqttServerBootstrap    (handles both 3.1.1 and 5.0 — version in CONNECT payload)
+  port 8883  → MqttServerBootstrap    + TLS
+  port 3306  → MysqlServerBootstrap   (STARTTLS)
+  port 5432  → PgWireServerBootstrap  (STARTTLS)
+  port 8081  → HttpServerBootstrap
+  port 8080  → HealthServerBootstrap
 ```
 
-**Netty pipeline installation:**
-```
-ProtocolDetector peeks 8 bytes →
-  match → remove self → install protocol-specific codec → fire channelRead
-  no match → send error and close
-
-HTTP port (8081): dedicated ServerBootstrap with HttpServerCodec pre-installed
-  → no detection needed; pipeline is pre-wired for HTTP
-```
+MQTT version (3.1.1 vs 5.0) and AMQP version (0-9-1 vs 1.0) are discriminated inside the
+first protocol frame (`CONNECT` / AMQP protocol header) by the respective codec — not by
+the server bootstrap.
 
 ---
 
@@ -839,7 +833,7 @@ The HTTP adapter exposes a simple REST API for producing and consuming messages.
 It does not require a persistent connection. Authentication is per-request.
 
 **Port assignment:** 8081 (separate from the admin/metrics port 8080).
-No magic-byte detection needed — the port is dedicated.
+Port is dedicated; `HttpServerBootstrap` pre-installs `HttpServerCodec`.
 
 ### Authentication
 

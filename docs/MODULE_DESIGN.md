@@ -455,7 +455,7 @@ com.ivy.server/
   BrokerMain.java                    — entry point, manual IoC assembly (no DI framework)
   NettyBrokerServer.java             — Netty ServerBootstrap, EventLoopGroup lifecycle
   NettyPipelineFactory.java          — builds per-connection pipeline using ProtocolBundleRegistry
-  ProtocolDetector.java              — peeks first 8 bytes, selects ProtocolBundle
+  PerProtocolBootstrap.java          — one ServerBootstrap per port; codec pre-wired, no detection
   FlowControlHandler.java            — channel backpressure (high/low watermarks)
   ServerExceptionHandler.java        — catch-all, log + graceful close
   GracefulShutdown.java              — drain → release partitions → close connections → exit
@@ -550,8 +550,7 @@ public static void main(String[] args) {
 [SslHandler]               optional, per-port TLS config
 [TenantResolverHandler]    SNI hostname → TenantId (stored as ChannelAttr)
 [ConnectionLimitHandler]   max connections per tenant
-[ProtocolDetector]         peeks 8 bytes → selects matching ProtocolBundle
-                           → installs bundle.newFrameDecoder() + bundle.newRequestHandler()
+[Protocol codec]           pre-installed by ServerBootstrap at bind time (port = protocol)
 [FlowControlHandler]       high/low watermark backpressure
 [ServerExceptionHandler]   catch-all, log + graceful close
 ```
@@ -732,7 +731,7 @@ autoresearch-v8/
 │       ├── BrokerMain.java
 │       ├── NettyBrokerServer.java
 │       ├── NettyPipelineFactory.java
-│       ├── ProtocolDetector.java
+│       ├── PerProtocolBootstrap.java
 │       ├── TenantResolverHandler.java
 │       ├── ConnectionLimitHandler.java
 │       ├── FlowControlHandler.java

@@ -66,7 +66,7 @@
 ### ivy-server (Kafka only)
 - [ ] `BrokerMain` — single-broker assembly
 - [ ] `NettyPipelineFactory` — Kafka only
-- [ ] `ProtocolDetector` — Kafka magic bytes
+- [ ] `KafkaServerBootstrap` — dedicated ServerBootstrap for port 9092/9093; codec pre-wired
 - [ ] `KafkaRequestHandler` — Produce, Fetch, Metadata, ListOffsets
 - [ ] `KafkaConsumerGroupHandler` — JoinGroup, SyncGroup, Heartbeat, LeaveGroup, OffsetCommit/Fetch
 - [ ] `KafkaTransactionHandler` — InitProducerId, AddPartitions, EndTxn, TxnOffsetCommit
@@ -137,7 +137,7 @@
 - [ ] Message-Expiry-Interval → DLQ (TTL_EXPIRED)
 - [ ] Topic alias resolution in `MqttSessionState`
 
-- [ ] Update `ProtocolDetector` — AMQP version discrimination (bytes 4-7), MQTT version read from CONNECT payload
+- [ ] `Amqp091ServerBootstrap`, `Amqp10ServerBootstrap`, `MqttServerBootstrap` — dedicated per-protocol bootstraps; AMQP/MQTT version discriminated inside first protocol frame by codec
 - [ ] Update `NettyPipelineFactory` — 5 messaging protocol handlers
 
 ### Tests
@@ -177,7 +177,7 @@
 - [ ] `PgWireRequestHandler` — startup, simple query dispatch
 - [ ] `PgWireQueryExecutor` — same as MySQL but PgWire encoding
 - [ ] `SqlQueryParser` — sealed SqlQuery hierarchy
-- [ ] Update `ProtocolDetector` for MySQL + PgWire
+- [ ] `MysqlServerBootstrap`, `PgWireServerBootstrap` — dedicated bootstraps; STARTTLS handled inside codec
 - [ ] Update `NettyPipelineFactory` for all 7 protocols (add MySQL, PgWire, HTTP)
 
 ### ivy-protocol-http

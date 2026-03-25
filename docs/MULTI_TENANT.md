@@ -61,7 +61,7 @@ value record TenantId(UUID id) {
 record TenantContext(
     TenantId    tenantId,       // required
     String      sniHostname,    // required (e.g. "acme.broker.example.com")
-    ProtocolId  protocol,       // nullable: unknown until ProtocolDetector fires
+    ProtocolId  protocol,       // known at bind time (port = protocol)
     UUID        connectionId    // nullable: set per-connection
 ) {
     // JEP 506 ScopedValue (primary mechanism for virtual threads)
@@ -524,7 +524,7 @@ broker:
 |-------|--------|-------------|
 | TLS + SNI | ivy-server | Extract SNI → TenantId; per-tenant SslContext |
 | Tenant resolution | ivy-server | TenantRegistry lookup, status check, reject SUSPENDED |
-| Protocol detection | ivy-server | `ProtocolDetector` sets `TenantContext.protocol` |
+| Protocol binding | ivy-server | Port = protocol; `TenantContext.protocol` set at ServerBootstrap bind time |
 | Auth | ivy-broker | `ScramCredentialStore(tenantId, username)` |
 | Authorization | ivy-broker | `AclStore(tenantId, principal, resource, op, protocol)` |
 | Quota | ivy-broker | `TokenBucketQuotaManager(tenantId, principal)` |

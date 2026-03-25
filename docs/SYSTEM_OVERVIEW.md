@@ -22,7 +22,7 @@ from the same offsets. PostgreSQL decides durability; the broker decides routing
 │  │ Kafka  │ │AMQP091 │ │AMQP 10 │ │MQTT311 │ │ MQTT5  │ │MySQL │ │ PG   │ │HTTP  │ │
 │  │Handler │ │Handler │ │Handler │ │Handler │ │Handler │ │Handlr│ │Handlr│ │Handlr│ │
 │  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └──────┘ └──────┘ └──────┘ │
-│  NettyPipelineFactory │ ProtocolDetector │ BrokerMain            │
+│  NettyPipelineFactory │ BrokerMain                            │
 ├──────────────────────────────────────────────────────────────────┤
 │                         ivy-codec                                │
 │   ivy-protocol-kafka  │  ivy-protocol-amqp   │  ivy-protocol-mqtt   │  ivy-protocol-pg/mysql  │  ivy-protocol-http  │
